@@ -1,6 +1,6 @@
 <script lang="ts">
   import HUDContainer from './lib/components/HUDContainer.svelte';
-  import { hudState } from './lib/state/hud.svelte.ts';
+  import { hudState } from './lib/state/hud.svelte.js';
 
   type Guide = {
     id: string;
