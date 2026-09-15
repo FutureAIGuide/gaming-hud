@@ -53,9 +53,10 @@
 </script>
 
 <section
-  class="hud-shell fixed inset-4 pointer-events-none"
+  class={`hud-shell fixed inset-4 pointer-events-none ${hudState.overlayVisible ? '' : 'hidden'}`}
   style={`z-index: ${hudState.zLayer};`}
   aria-label="Gaming HUD overlay container"
+  aria-hidden={!hudState.overlayVisible}
 >
   <div class="pointer-events-auto h-full w-full">
     <header class="mb-3 flex items-center justify-between rounded-2xl border border-white/20 bg-white/10 px-4 py-2 text-white backdrop-blur-md">

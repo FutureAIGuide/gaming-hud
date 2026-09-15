@@ -62,11 +62,9 @@
     </button>
   </div>
 
-  {#if hudState.overlayVisible}
-    <HUDContainer
-      {games}
-      {activeGuide}
-      onSelectGuide={handleSelectGuide}
-    />
-  {/if}
+  <HUDContainer
+    {games}
+    {activeGuide}
+    onSelectGuide={handleSelectGuide}
+  />
 </main>

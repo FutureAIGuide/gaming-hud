@@ -20,6 +20,9 @@ export const hudState = $state({
 }) as HudState;
 
 hudState.setActiveGame = (gameId: string | null): void => {
+  if (hudState.activeGameId !== gameId) {
+    hudState.activeGuideId = null;
+  }
   hudState.activeGameId = gameId;
 };
 
