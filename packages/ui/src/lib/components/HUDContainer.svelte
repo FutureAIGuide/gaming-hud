@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { hudState } from '../state/hud.svelte.ts';
+  import { hudState } from '../state/hud.svelte.js';
 
   type Guide = {
     id: string;
