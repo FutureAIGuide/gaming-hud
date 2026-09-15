@@ -116,6 +116,16 @@ test("skips draft pull requests", async () => {
   );
 });
 
+test("rejects non-open pull requests", async () => {
+  await withGitHub(
+    { files: [{ filename: "version.txt" }] },
+    async (pull) => {
+      pull.state = "closed";
+      await assert.rejects(run(), /must be open for review/);
+    },
+  );
+});
+
 test("requires human approval for non-release changes to exempt paths", async () => {
   await withGitHub(
     { files: [{ filename: "packages/turbo/package.json" }] },

@@ -103,14 +103,15 @@ export async function run() {
   const pullNumber = requiredEnv("PR_NUMBER");
   const pull = await github(`/repos/${repository}/pulls/${pullNumber}`);
 
-  if (
-    pull.base.ref !== pull.base.repo.default_branch ||
-    pull.base.repo.full_name !== repository ||
-    pull.state !== "open" ||
-    pull.draft
-  ) {
+  if (pull.base.ref !== pull.base.repo.default_branch || pull.draft) {
     console.log("Pull request metadata is not eligible for review; skipping");
     return;
+  }
+  if (pull.base.repo.full_name !== repository) {
+    throw new Error("Pull request base repository does not match the target");
+  }
+  if (pull.state !== "open") {
+    throw new Error("Pull request must be open for review");
   }
 
   const expectedHeadSha = process.env.EXPECTED_HEAD_SHA;
