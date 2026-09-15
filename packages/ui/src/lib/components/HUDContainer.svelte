@@ -82,15 +82,12 @@
       >
         {#if hasItems}
           {#each layoutItems as guide (guide.id)}
-            <li
-              class="rounded-xl border border-white/15 bg-black/25 p-3 transition-transform duration-150 hover:scale-[1.01] focus-within:scale-[1.01]"
-              aria-current={activeGuide?.id === guide.id ? 'true' : undefined}
-            >
+            <li class="rounded-xl border border-white/15 bg-black/25 p-3 transition-transform duration-150 hover:scale-[1.01] focus-within:scale-[1.01]">
               <button
                 type="button"
                 class="w-full rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
                 onclick={() => handleSelect(guide)}
-                aria-label={`Select guide ${guide.title}`}
+                aria-label={activeGuide?.id === guide.id ? `Select guide ${guide.title} (currently active)` : `Select guide ${guide.title}`}
               >
                 <p class="text-xs uppercase tracking-wide text-cyan-200/90">{guide.gameName}</p>
                 <h3 class="mt-1 text-sm font-semibold">{guide.title}</h3>
