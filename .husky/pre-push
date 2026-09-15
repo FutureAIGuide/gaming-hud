@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# Turbo leftover hook disabled for the HUD scaffold publish.
+exit 0

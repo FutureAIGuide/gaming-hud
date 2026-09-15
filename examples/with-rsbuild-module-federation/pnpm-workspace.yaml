@@ -1,0 +1,9 @@
+packages:
+  - host
+  - remote
+  - shared-ui
+
+catalog:
+  "@module-federation/rsbuild-plugin": 2.8.2
+  "@rsbuild/core": 2.1.13
+  "@rsbuild/plugin-react": 2.1.0

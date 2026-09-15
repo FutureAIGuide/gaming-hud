@@ -1,0 +1,993 @@
+//! Environment variable filtering for tasks and hashing for cache keys.
+
+#![deny(clippy::all)]
+
+use std::{
+    collections::HashMap,
+    env,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
+use dashmap::DashMap;
+use regex::{Regex, RegexBuilder};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+pub mod platform;
+
+const DEFAULT_ENV_VARS: &[&str] = ["VERCEL_ANALYTICS_ID", "VERCEL_TARGET_ENV"].as_slice();
+
+pub const BUILTIN_PASS_THROUGH_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "TZ",
+    "LANG",
+    "SHELL",
+    "PWD",
+    "XDG_DATA_*",
+    "XDG_RUNTIME_DIR",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "CI",
+    "NODE_OPTIONS",
+    "COREPACK_*",
+    "LD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "LIBPATH",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    "COLORTERM",
+    "FORCE_COLOR",
+    "NO_COLOR",
+    "TERM",
+    "TERM_PROGRAM",
+    "DISPLAY",
+    "TMP",
+    "TEMP",
+    // Windows
+    "WINDIR",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    // VSCode IDE
+    "VSCODE_*",
+    "ELECTRON_RUN_AS_NODE",
+    // Docker
+    "DOCKER_*",
+    "BUILDKIT_*",
+    // Docker compose
+    "COMPOSE_*",
+    // Jetbrains IDE
+    "JB_IDE_*",
+    "JB_INTERPRETER",
+    "_JETBRAINS_TEST_RUNNER_RUN_SCOPE_TYPE",
+    // Turborepo config (needed for nested turbo invocations)
+    "TURBO_*",
+    // Vercel specific
+    "VERCEL",
+    "VERCEL_*",
+    "NEXT_*",
+    "USE_OUTPUT_FOR_EDGE_FUNCTIONS",
+    "NOW_BUILDER",
+    "VC_MICROFRONTENDS_CONFIG_FILE_NAME",
+    // GitHub Actions
+    "GITHUB_*",
+    "RUNNER_*",
+    // NixOS
+    "__NIXOS_*",
+    "NIX_*",
+    // Command Prompt casing of env variables
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATH",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "PNPM_HOME",
+    "pnpm_config_verify_deps_before_run",
+    "NPM_CONFIG_STORE_DIR",
+    // Needed by npm to spawn scripts now that turbo invokes the bundled npm
+    // directly instead of going through cmd.exe (see vercel/turborepo#13113)
+    "COMSPEC",
+    "PATHEXT",
+];
+
+#[derive(Clone, Debug, Error)]
+pub enum Error {
+    #[error("Failed to parse regex: {0}")]
+    Regex(#[from] regex::Error),
+}
+
+// TODO: Consider using immutable data structures here
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct EnvironmentVariableMap(HashMap<String, String>);
+
+impl EnvironmentVariableMap {
+    // Returns a deterministically sorted set of EnvironmentVariablePairs
+    // from an EnvironmentVariableMap.
+    // This is the value that is used upstream as a task hash input,
+    // so we need it to be deterministic
+    pub fn to_hashable(&self) -> EnvironmentVariablePairs {
+        let mut list: Vec<_> = self.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        list.sort();
+
+        list
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.keys().cloned().collect();
+        names.sort();
+
+        names
+    }
+
+    // Returns a deterministically sorted set of EnvironmentVariablePairs
+    // from an EnvironmentVariableMap
+    // This is the value used to print out the task hash input,
+    // so the values are cryptographically hashed
+    pub fn to_secret_hashable(&self) -> EnvironmentVariablePairs {
+        let mut pairs: Vec<String> = self
+            .iter()
+            .map(|(k, v)| {
+                if !v.is_empty() {
+                    let mut hasher = Sha256::new();
+                    hasher.update(v.as_bytes());
+                    let hash = hasher.finalize();
+                    let hexed_hash = hex::encode(hash);
+                    format!("{k}={hexed_hash}")
+                } else {
+                    format!("{k}=")
+                }
+            })
+            .collect();
+        // Make it deterministic to facilitate comparisons
+        pairs.sort();
+        pairs
+    }
+}
+
+// BySource contains a map of environment variables broken down by the source
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct BySource {
+    pub explicit: EnvironmentVariableMap,
+    pub matching: EnvironmentVariableMap,
+}
+
+// DetailedMap contains the composite and the detailed maps of environment
+// variables All is used as a taskhash input (taskhash.CalculateTaskHash)
+// BySource is used by dry runs and run summaries
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct DetailedMap {
+    pub all: EnvironmentVariableMap,
+    pub by_source: BySource,
+}
+
+impl DetailedMap {
+    /// Combines framework-inferred env vars with the user's task env matches,
+    /// giving user exclusions primacy over inferred inclusions.
+    pub fn from_task_env_parts(inference: &EnvironmentVariableMap, user: &WildcardMaps) -> Self {
+        let mut all = EnvironmentVariableMap::default();
+        all.union(&user.inclusions);
+        all.union(inference);
+        all.difference(&user.exclusions);
+
+        let mut explicit = EnvironmentVariableMap::default();
+        explicit.union(&user.inclusions);
+        explicit.difference(&user.exclusions);
+
+        let mut matching = EnvironmentVariableMap::default();
+        matching.union(inference);
+        matching.difference(&user.exclusions);
+
+        DetailedMap {
+            all,
+            by_source: BySource { explicit, matching },
+        }
+    }
+}
+
+// A list of "k=v" strings for env variables and their values
+pub type EnvironmentVariablePairs = Vec<String>;
+
+// WildcardMaps is a pair of EnvironmentVariableMaps.
+#[derive(Debug)]
+pub struct WildcardMaps {
+    pub inclusions: EnvironmentVariableMap,
+    pub exclusions: EnvironmentVariableMap,
+}
+
+impl WildcardMaps {
+    // Resolve collapses a WildcardSet into a single EnvironmentVariableMap.
+    fn resolve(self) -> EnvironmentVariableMap {
+        let mut output = self.inclusions;
+        output.difference(&self.exclusions);
+        output
+    }
+}
+
+/// The result of matching one wildcard pattern list against an environment.
+pub struct WildcardMatch {
+    /// The inclusions and exclusions matched by the patterns.
+    pub maps: WildcardMaps,
+    /// `maps` collapsed into a single map (inclusions minus exclusions).
+    pub resolved: EnvironmentVariableMap,
+}
+
+/// Memoizes wildcard matches against a fixed environment, keyed by pattern
+/// list.
+///
+/// Task env configurations repeat heavily across the tasks in a run, so this
+/// avoids recompiling regexes and rescanning the environment for every task.
+/// Only valid for as long as the underlying environment map is unchanged;
+/// callers are expected to match one cache to one environment snapshot.
+#[derive(Default)]
+pub struct WildcardMapCache {
+    cache: DashMap<Box<[String]>, Arc<WildcardMatch>>,
+}
+
+impl WildcardMapCache {
+    pub fn get_or_compute(
+        &self,
+        env: &EnvironmentVariableMap,
+        patterns: &[String],
+    ) -> Result<Arc<WildcardMatch>, Error> {
+        if let Some(hit) = self.cache.get(patterns) {
+            return Ok(hit.clone());
+        }
+        let maps = env.wildcard_map_from_wildcards_unresolved(patterns)?;
+        let mut resolved = maps.inclusions.clone();
+        resolved.difference(&maps.exclusions);
+        let entry = Arc::new(WildcardMatch { maps, resolved });
+        self.cache.insert(patterns.into(), entry.clone());
+        Ok(entry)
+    }
+}
+
+/// Pre-compiled include/exclude wildcard regexes. Compile once and reuse
+/// across tasks that share the same wildcard patterns.
+pub struct CompiledWildcards {
+    include_regex: Option<Regex>,
+    exclude_regex: Option<Regex>,
+}
+
+impl CompiledWildcards {
+    pub fn compile(wildcard_patterns: &[impl AsRef<str>]) -> Result<Self, Error> {
+        let mut include_patterns = Vec::new();
+        let mut exclude_patterns = Vec::new();
+
+        for wildcard_pattern in wildcard_patterns {
+            let wildcard_pattern = wildcard_pattern.as_ref();
+            if let Some(rest) = wildcard_pattern.strip_prefix('!') {
+                exclude_patterns.push(wildcard_to_regex_pattern(rest));
+            } else if wildcard_pattern.starts_with("\\!") {
+                include_patterns.push(wildcard_to_regex_pattern(&wildcard_pattern[1..]));
+            } else {
+                include_patterns.push(wildcard_to_regex_pattern(wildcard_pattern));
+            }
+        }
+
+        let case_insensitive = cfg!(windows);
+
+        let include_regex = if include_patterns.is_empty() {
+            None
+        } else {
+            let pattern = format!("^({})$", include_patterns.join("|"));
+            Some(
+                RegexBuilder::new(&pattern)
+                    .case_insensitive(case_insensitive)
+                    .build()?,
+            )
+        };
+
+        let exclude_regex = if exclude_patterns.is_empty() {
+            None
+        } else {
+            let pattern = format!("^({})$", exclude_patterns.join("|"));
+            Some(
+                RegexBuilder::new(&pattern)
+                    .case_insensitive(case_insensitive)
+                    .build()?,
+            )
+        };
+
+        Ok(CompiledWildcards {
+            include_regex,
+            exclude_regex,
+        })
+    }
+}
+
+impl From<HashMap<String, String>> for EnvironmentVariableMap {
+    fn from(map: HashMap<String, String>) -> Self {
+        EnvironmentVariableMap(map)
+    }
+}
+
+impl Deref for EnvironmentVariableMap {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for EnvironmentVariableMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl EnvironmentVariableMap {
+    pub fn infer() -> Self {
+        EnvironmentVariableMap(env::vars().collect())
+    }
+
+    pub fn into_inner(self) -> HashMap<String, String> {
+        self.0
+    }
+
+    // Takes another EnvironmentVariableMap and adds it into `self`
+    // Overwrites values if they already exist.
+    pub fn union(&mut self, another: &EnvironmentVariableMap) {
+        for (key, value) in &another.0 {
+            self.0.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Takes another EnvironmentVariableMap and removes matching keys
+    // from `self`
+    pub fn difference(&mut self, another: &EnvironmentVariableMap) {
+        for key in another.0.keys() {
+            self.0.remove(key);
+        }
+    }
+
+    /// Match the builtin passthrough list once against this environment
+    /// snapshot. Callers should reuse the resulting map across tasks, not
+    /// rematch per task.
+    pub fn builtin_pass_through_env(&self) -> Result<EnvironmentVariableMap, Error> {
+        // Windows regexes use Unicode case folding, not ASCII-only comparisons.
+        #[cfg(windows)]
+        {
+            let compiled = CompiledWildcards::compile(BUILTIN_PASS_THROUGH_ENV)?;
+            Ok(self.from_compiled_wildcards(&compiled))
+        }
+        #[cfg(not(windows))]
+        {
+            let mut output = EnvironmentVariableMap::default();
+            // The builtin list contains only literals and literal prefixes followed
+            // by one star. A test below guards this invariant.
+            for pattern in BUILTIN_PASS_THROUGH_ENV {
+                if let Some(prefix) = pattern.strip_suffix('*') {
+                    for (name, value) in &self.0 {
+                        if name
+                            .strip_prefix(prefix)
+                            .is_some_and(|suffix| !suffix.contains('\n'))
+                        {
+                            // Regex `.*` matches Unicode and CR, but not LF.
+                            output.insert(name.clone(), value.clone());
+                        }
+                    }
+                } else if let Some((name, value)) = self.get_key_value(*pattern) {
+                    output.insert(name.clone(), value.clone());
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    // returns a WildcardMaps after processing wildcards against it.
+    fn wildcard_map_from_wildcards(
+        &self,
+        wildcard_patterns: &[impl AsRef<str>],
+    ) -> Result<WildcardMaps, Error> {
+        #[cfg(not(windows))]
+        {
+            // Normalize only the leading include/exclude marker. Leave all other
+            // escaping and wildcard syntax to the existing regex implementation.
+            let literal_patterns = || {
+                wildcard_patterns.iter().map(|pattern| {
+                    let pattern = pattern.as_ref();
+                    if let Some(rest) = pattern.strip_prefix('!') {
+                        (true, rest)
+                    } else if pattern.starts_with("\\!") {
+                        (false, &pattern[1..])
+                    } else {
+                        (false, pattern)
+                    }
+                })
+            };
+            if literal_patterns().all(|(_, pattern)| !pattern.contains(['*', '\\'])) {
+                let mut output = WildcardMaps {
+                    inclusions: EnvironmentVariableMap::default(),
+                    exclusions: EnvironmentVariableMap::default(),
+                };
+                for (excluded, pattern) in literal_patterns() {
+                    if let Some((name, value)) = self.get_key_value(pattern) {
+                        let map = if excluded {
+                            &mut output.exclusions
+                        } else {
+                            &mut output.inclusions
+                        };
+                        map.insert(name.clone(), value.clone());
+                    }
+                }
+                return Ok(output);
+            }
+        }
+        self.wildcard_map_from_wildcards_regex(wildcard_patterns)
+    }
+
+    fn wildcard_map_from_wildcards_regex(
+        &self,
+        wildcard_patterns: &[impl AsRef<str>],
+    ) -> Result<WildcardMaps, Error> {
+        let mut output = WildcardMaps {
+            inclusions: EnvironmentVariableMap::default(),
+            exclusions: EnvironmentVariableMap::default(),
+        };
+
+        let mut include_patterns = Vec::new();
+        let mut exclude_patterns = Vec::new();
+
+        for wildcard_pattern in wildcard_patterns {
+            let wildcard_pattern = wildcard_pattern.as_ref();
+            if let Some(rest) = wildcard_pattern.strip_prefix('!') {
+                let exclude_pattern = wildcard_to_regex_pattern(rest);
+                exclude_patterns.push(exclude_pattern);
+            } else if wildcard_pattern.starts_with("\\!") {
+                let include_pattern = wildcard_to_regex_pattern(&wildcard_pattern[1..]);
+                include_patterns.push(include_pattern);
+            } else {
+                let include_pattern = wildcard_to_regex_pattern(wildcard_pattern);
+                include_patterns.push(include_pattern);
+            }
+        }
+
+        let include_regex_string = format!("^({})$", include_patterns.join("|"));
+        let exclude_regex_string = format!("^({})$", exclude_patterns.join("|"));
+
+        let case_insensitive = cfg!(windows);
+        let include_regex = RegexBuilder::new(&include_regex_string)
+            .case_insensitive(case_insensitive)
+            .build()?;
+        let exclude_regex = RegexBuilder::new(&exclude_regex_string)
+            .case_insensitive(case_insensitive)
+            .build()?;
+        for (env_var, env_value) in &self.0 {
+            if !include_patterns.is_empty() && include_regex.is_match(env_var) {
+                output.inclusions.insert(env_var.clone(), env_value.clone());
+            }
+            if !exclude_patterns.is_empty() && exclude_regex.is_match(env_var) {
+                output.exclusions.insert(env_var.clone(), env_value.clone());
+            }
+        }
+
+        Ok(output)
+    }
+
+    // Returns an EnvironmentVariableMap containing the variables
+    // in the environment which match an array of wildcard patterns.
+    pub fn from_wildcards(
+        &self,
+        wildcard_patterns: &[impl AsRef<str>],
+    ) -> Result<EnvironmentVariableMap, Error> {
+        if wildcard_patterns.is_empty() {
+            return Ok(EnvironmentVariableMap::default());
+        }
+
+        let resolved_set = self.wildcard_map_from_wildcards(wildcard_patterns)?;
+        Ok(resolved_set.resolve())
+    }
+
+    // FromWildcardsUnresolved returns a wildcardSet specifying the inclusions and
+    // exclusions discovered from a set of wildcard patterns. This is used to ensure
+    // that user exclusions have primacy over inferred inclusions.
+    pub fn wildcard_map_from_wildcards_unresolved(
+        &self,
+        wildcard_patterns: &[impl AsRef<str>],
+    ) -> Result<WildcardMaps, Error> {
+        if wildcard_patterns.is_empty() {
+            return Ok(WildcardMaps {
+                inclusions: EnvironmentVariableMap::default(),
+                exclusions: EnvironmentVariableMap::default(),
+            });
+        }
+
+        self.wildcard_map_from_wildcards(wildcard_patterns)
+    }
+
+    /// Return a detailed map for which environment variables are factored into
+    /// the task's hash
+    pub fn hashable_task_env(
+        &self,
+        computed_wildcards: &[String],
+        task_env: &[String],
+    ) -> Result<DetailedMap, Error> {
+        let inference_env_var_map = self.from_wildcards(computed_wildcards)?;
+        let user_env_var_set = self.wildcard_map_from_wildcards_unresolved(task_env)?;
+        Ok(DetailedMap::from_task_env_parts(
+            &inference_env_var_map,
+            &user_env_var_set,
+        ))
+    }
+
+    /// Like `from_wildcards` but uses pre-compiled regexes.
+    pub fn from_compiled_wildcards(&self, compiled: &CompiledWildcards) -> EnvironmentVariableMap {
+        let mut output = EnvironmentVariableMap::default();
+        for (env_var, env_value) in &self.0 {
+            let included = compiled
+                .include_regex
+                .as_ref()
+                .is_some_and(|re| re.is_match(env_var));
+            let excluded = compiled
+                .exclude_regex
+                .as_ref()
+                .is_some_and(|re| re.is_match(env_var));
+            if included && !excluded {
+                output.insert(env_var.clone(), env_value.clone());
+            }
+        }
+        output
+    }
+}
+
+/// Constructs an environment map that contains pass through environment
+/// variables from pre-matched parts. `builtin_pass_through` and the task's
+/// `WildcardMaps` are expected to have been matched against the same
+/// environment snapshot.
+pub fn pass_through_env_from_parts(
+    builtin_pass_through: &EnvironmentVariableMap,
+    global_env: &EnvironmentVariableMap,
+    task_pass_through: &WildcardMaps,
+) -> EnvironmentVariableMap {
+    let mut pass_through_env = EnvironmentVariableMap::default();
+    pass_through_env.union(builtin_pass_through);
+    pass_through_env.union(global_env);
+    pass_through_env.union(&task_pass_through.inclusions);
+    pass_through_env.difference(&task_pass_through.exclusions);
+    pass_through_env
+}
+
+const WILDCARD: char = '*';
+const WILDCARD_ESCAPE: char = '\\';
+const REGEX_WILDCARD_SEGMENT: &str = ".*";
+
+fn wildcard_to_regex_pattern(pattern: &str) -> String {
+    let mut regex_string = Vec::new();
+    let mut previous_index = 0;
+    let mut previous_char: Option<char> = None;
+
+    for (i, char) in pattern.char_indices() {
+        if char == WILDCARD {
+            if previous_char == Some(WILDCARD_ESCAPE) {
+                // Found a literal *
+                // Replace the trailing "\*" with just "*" before adding the segment.
+                regex_string.push(regex::escape(&format!(
+                    "{}*",
+                    &pattern[previous_index..(i - 1)]
+                )));
+            } else {
+                // Found a wildcard
+                // Add in the static segment since the last wildcard. Can be zero length.
+                regex_string.push(regex::escape(&pattern[previous_index..i]));
+
+                // Add a dynamic segment if it isn't adjacent to another dynamic segment.
+                if let Some(last_segment) = regex_string.last()
+                    && last_segment != REGEX_WILDCARD_SEGMENT
+                {
+                    regex_string.push(REGEX_WILDCARD_SEGMENT.to_string());
+                }
+            }
+
+            // Advance the pointer.
+            previous_index = i + 1;
+        }
+        previous_char = Some(char);
+    }
+
+    // Add the last static segment. Can be zero length.
+    regex_string.push(regex::escape(&pattern[previous_index..]));
+
+    regex_string.join("")
+}
+
+pub fn get_global_hashable_env_vars(
+    env_at_execution_start: &EnvironmentVariableMap,
+    global_env: &[String],
+) -> Result<DetailedMap, Error> {
+    let default_env_var_map = env_at_execution_start.from_wildcards(DEFAULT_ENV_VARS)?;
+
+    let user_env_var_set =
+        env_at_execution_start.wildcard_map_from_wildcards_unresolved(global_env)?;
+
+    let mut all_env_var_map = EnvironmentVariableMap::default();
+    all_env_var_map.union(&user_env_var_set.inclusions);
+    all_env_var_map.union(&default_env_var_map);
+    all_env_var_map.difference(&user_env_var_set.exclusions);
+
+    let mut explicit_env_var_map = EnvironmentVariableMap::default();
+    explicit_env_var_map.union(&user_env_var_set.inclusions);
+    explicit_env_var_map.difference(&user_env_var_set.exclusions);
+
+    let mut matching_env_var_map = EnvironmentVariableMap::default();
+    matching_env_var_map.union(&default_env_var_map);
+    matching_env_var_map.difference(&explicit_env_var_map);
+
+    Ok(DetailedMap {
+        all: all_env_var_map,
+        by_source: BySource {
+            explicit: explicit_env_var_map,
+            matching: matching_env_var_map,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    #[test_case("LITERAL_\\*", "LITERAL_\\*" ; "literal star")]
+    #[test_case("\\*LEADING", "\\*LEADING" ; "leading literal star")]
+    #[test_case("\\!LEADING", "\\\\!LEADING" ; "leading literal bang")]
+    #[test_case("!LEADING", "!LEADING" ; "leading bang")]
+    #[test_case("*LEADING", ".*LEADING" ; "leading star")]
+    fn test_wildcard_to_regex_pattern(pattern: &str, expected: &str) {
+        let actual = super::wildcard_to_regex_pattern(pattern);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_case_sensitivity() {
+        let start = EnvironmentVariableMap(
+            vec![("Turbo".to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let actual = start.from_wildcards(&["TURBO"]).unwrap();
+        if cfg!(windows) {
+            assert_eq!(actual.get("Turbo").map(|s| s.as_str()), Some("true"));
+        } else {
+            assert_eq!(actual.get("Turbo"), None);
+        }
+    }
+
+    #[test_case(&[], &["VERCEL_ANALYTICS_ID", "VERCEL_TARGET_ENV"] ; "defaults")]
+    #[test_case(&["!VERCEL*"], &[] ; "removing defaults")]
+    #[test_case(&["FOO*", "!FOOD"], &["FOO", "FOOBAR", "VERCEL_ANALYTICS_ID", "VERCEL_TARGET_ENV"] ; "intersecting globs")]
+    fn test_global_env(inputs: &[&str], expected: &[&str]) {
+        let env_at_start = EnvironmentVariableMap(
+            vec![
+                ("VERCEL_TARGET_ENV", "prod"),
+                ("VERCEL_ANALYTICS_ID", "1"),
+                ("FOO", "bar"),
+                ("FOOBAR", "baz"),
+                ("FOOD", "cheese"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
+        let inputs = inputs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let actual = get_global_hashable_env_vars(&env_at_start, &inputs).unwrap();
+        let mut actual = actual.all.keys().map(|s| s.as_str()).collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn global_hashable_env_vars_match_basic_monorepo_contract() {
+        let env_at_start = EnvironmentVariableMap(
+            vec![
+                ("SOME_ENV_VAR", "hi"),
+                ("VERCEL_ANALYTICS_ID", "analytics"),
+                ("SOMETHING_THASH_YES", "ignored"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        );
+        let actual =
+            get_global_hashable_env_vars(&env_at_start, &["SOME_ENV_VAR".to_string()]).unwrap();
+
+        assert_eq!(
+            actual.all.names(),
+            vec!["SOME_ENV_VAR", "VERCEL_ANALYTICS_ID"]
+        );
+        assert_eq!(actual.by_source.explicit.names(), vec!["SOME_ENV_VAR"]);
+        assert_eq!(
+            actual.by_source.matching.names(),
+            vec!["VERCEL_ANALYTICS_ID"]
+        );
+    }
+
+    #[test_case(&["FOO*"], &["BAR"], &["BAR", "FOO", "FOOBAR", "FOOD"] ; "wildcard")]
+    #[test_case(&["FOO*", "!FOOBAR"], &["BAR"], &["BAR", "FOO", "FOOD"] ; "omit wild")]
+    #[test_case(&["FOO*"], &["!FOOBAR"], &["FOO", "FOOD"] ; "omit task")]
+    #[test_case(&["FOO*"], &["!FOO*"], &[] ; "exclude all framework vars")]
+    fn test_hashable_env(wildcards: &[&str], task: &[&str], expected: &[&str]) {
+        let env_at_start = EnvironmentVariableMap(
+            vec![
+                ("FOO", "bar"),
+                ("FOOBAR", "baz"),
+                ("FOOD", "cheese"),
+                ("BAR", "nuts"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
+        let wildcards: Vec<_> = wildcards.iter().map(|s| s.to_string()).collect();
+        let task: Vec<_> = task.iter().map(|s| s.to_string()).collect();
+        let output = env_at_start.hashable_task_env(&wildcards, &task).unwrap();
+        let mut actual: Vec<_> = output.all.keys().map(|s| s.as_str()).collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test_case(&["FOO*"], &["FOO", "FOOBAR", "FOOD", "PATH"] ; "folds 3 sources")]
+    #[test_case(&["!FOO"], &["PATH"] ; "remove global")]
+    #[test_case(&["!PATH"], &["FOO"] ; "remove builtin")]
+    #[test_case(&["FOO*", "!FOOD"], &["FOO", "FOOBAR", "PATH"] ; "mixing negations")]
+    fn test_pass_through_env_from_parts(task: &[&str], expected: &[&str]) {
+        let env_at_start = EnvironmentVariableMap(
+            vec![
+                ("PATH", "of"),
+                ("FOO", "bar"),
+                ("FOOBAR", "baz"),
+                ("FOOD", "cheese"),
+                ("BAR", "nuts"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
+        let global_env = EnvironmentVariableMap(
+            vec![("FOO", "bar")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        );
+        let builtins: &[&str] = &["PATH"];
+        let compiled = CompiledWildcards::compile(builtins).unwrap();
+        let builtin_pass_through = env_at_start.from_compiled_wildcards(&compiled);
+        let task: Vec<String> = task.iter().map(|s| s.to_string()).collect();
+        let task_pass_through = env_at_start
+            .wildcard_map_from_wildcards_unresolved(&task)
+            .unwrap();
+        let output =
+            pass_through_env_from_parts(&builtin_pass_through, &global_env, &task_pass_through);
+        let mut actual: Vec<_> = output.keys().map(|s| s.as_str()).collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_wildcard_map_cache_matches_uncached() {
+        let env = EnvironmentVariableMap(
+            vec![("FOO", "1"), ("FOOBAR", "2"), ("FOOD", "3"), ("BAR", "4")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        );
+
+        let patterns: Vec<String> = vec!["FOO*".to_string(), "!FOOD".to_string()];
+        let cache = WildcardMapCache::default();
+
+        // Hit the cache twice to exercise both the miss and hit paths.
+        for _ in 0..2 {
+            let cached = cache.get_or_compute(&env, &patterns).unwrap();
+            let uncached = env.from_wildcards(&patterns).unwrap();
+
+            let mut cached_keys: Vec<_> = cached.resolved.keys().cloned().collect();
+            let mut uncached_keys: Vec<_> = uncached.keys().cloned().collect();
+            cached_keys.sort();
+            uncached_keys.sort();
+            assert_eq!(cached_keys, uncached_keys);
+            assert_eq!(cached_keys, vec!["FOO", "FOOBAR"]);
+
+            let mut exclusion_keys: Vec<_> = cached.maps.exclusions.keys().cloned().collect();
+            exclusion_keys.sort();
+            assert_eq!(exclusion_keys, vec!["FOOD"]);
+        }
+    }
+
+    #[test]
+    fn test_wildcard_map_cache_empty_patterns() {
+        let env = EnvironmentVariableMap(
+            vec![("FOO", "bar")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        );
+        let cache = WildcardMapCache::default();
+        let cached = cache.get_or_compute(&env, &[]).unwrap();
+        assert!(cached.resolved.is_empty());
+        assert!(cached.maps.inclusions.is_empty());
+        assert!(cached.maps.exclusions.is_empty());
+    }
+
+    #[test]
+    fn test_compiled_wildcards_matches_from_wildcards() {
+        let env = EnvironmentVariableMap(
+            vec![
+                ("HOME", "/home/user"),
+                ("PATH", "/usr/bin"),
+                ("VSCODE_PID", "12345"),
+                ("DOCKER_HOST", "tcp://localhost"),
+                ("GITHUB_TOKEN", "ghp_xxx"),
+                ("NEXT_PUBLIC_API", "https://api"),
+                ("TURBO_TOKEN", "tkn_xxx"),
+                ("RANDOM_VAR", "value"),
+                ("CI", "true"),
+                ("VERCEL", "1"),
+                ("VERCEL_URL", "example.vercel.app"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
+
+        let original = env.from_wildcards(BUILTIN_PASS_THROUGH_ENV).unwrap();
+        let compiled = CompiledWildcards::compile(BUILTIN_PASS_THROUGH_ENV).unwrap();
+        let from_compiled = env.from_compiled_wildcards(&compiled);
+
+        let mut orig_keys: Vec<_> = original.keys().cloned().collect();
+        let mut comp_keys: Vec<_> = from_compiled.keys().cloned().collect();
+        orig_keys.sort();
+        comp_keys.sort();
+
+        assert_eq!(
+            orig_keys, comp_keys,
+            "compiled and original wildcard matching must produce identical keys"
+        );
+
+        for key in &orig_keys {
+            assert_eq!(
+                original.get(key),
+                from_compiled.get(key),
+                "values differ for key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builtin_pass_through_fast_path_shape() {
+        for pattern in BUILTIN_PASS_THROUGH_ENV {
+            let literal = pattern.strip_suffix('*').unwrap_or(pattern);
+            assert!(!literal.contains(['*', '\\']));
+            assert!(!literal.starts_with('!'));
+        }
+    }
+
+    #[test]
+    fn test_builtin_pass_through_matches_regex() {
+        let mut env = EnvironmentVariableMap::default();
+        for pattern in BUILTIN_PASS_THROUGH_ENV {
+            let base = pattern.strip_suffix('*').unwrap_or(pattern);
+            for suffix in [
+                "", "suffix", "é東京", "\r", "\n", "a\nb", "\r\n", "\u{2028}", "*",
+            ] {
+                let name = format!("{base}{suffix}");
+                env.insert(name.clone(), format!("value:{name}"));
+            }
+            env.insert(base.to_lowercase(), "lowercase".into());
+            env.insert(format!("BEFORE_{base}"), "not a prefix match".into());
+        }
+        // Unicode simple case folding on Windows must remain regex-based.
+        env.insert("DOCKER_HOST".into(), "kelvin".into());
+        env.insert("ſHELL".into(), "long s".into());
+        env.insert("ProgramFiles(x86)".into(), "literal parentheses".into());
+        let compiled = CompiledWildcards::compile(BUILTIN_PASS_THROUGH_ENV).unwrap();
+        assert_eq!(
+            env.builtin_pass_through_env().unwrap(),
+            env.from_compiled_wildcards(&compiled)
+        );
+    }
+
+    #[test_case(&[] ; "empty list")]
+    #[test_case(&["FOO", "!FOOD", "MISSING", "FOO"] ; "literals and independent exclusion")]
+    #[test_case(&["FOO", "!FOO"] ; "exclusion wins")]
+    #[test_case(&["!FOO"] ; "only exclusion")]
+    #[test_case(&["", "!"] ; "empty names")]
+    #[test_case(&["\\!BANG", "!!BANG"] ; "literal bang and exclusion")]
+    #[test_case(&["ProgramFiles(x86)", "A.B+$^[]{}?", "é東京", "A\nB", "A\rB"] ; "literal regex syntax and unicode")]
+    #[test_case(&["SHELL", "DOCKER_HOST"] ; "windows unicode folding")]
+    #[test_case(&["FOO*", "!FOOD", "BAR"] ; "wildcard fallback")]
+    #[test_case(&["*", "!FOO*"] ; "all wildcard fallback")]
+    #[test_case(&["FOO\\*", "\\\\*", "A\\B", "\\!BANG*"] ; "escape fallback")]
+    #[test_case(&["F**O*", "*é*", "!A*B"] ; "arbitrary wildcard fallback")]
+    fn test_wildcard_fast_path_matches_regex(patterns: &[&str]) {
+        let env = EnvironmentVariableMap::from(
+            [
+                "",
+                "FOO",
+                "FOOD",
+                "FOOBAR",
+                "BAR",
+                "!BANG",
+                "!BANG_MORE",
+                "FOO*",
+                "\\*",
+                "A\\B",
+                "ProgramFiles(x86)",
+                "A.B+$^[]{}?",
+                "é東京",
+                "A\nB",
+                "A\rB",
+                "FOO\n",
+                "FOO\r",
+                "foo",
+                "SHELL",
+                "shell",
+                "ſHELL",
+                "DOCKER_HOST",
+                "DOCKER_HOST",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_owned(), i.to_string()))
+            .collect::<HashMap<_, _>>(),
+        );
+        let actual = env
+            .wildcard_map_from_wildcards_unresolved(patterns)
+            .unwrap();
+        // Keep the old implementation as an independent oracle, including its
+        // unresolved exclusions (which can remove framework-inferred values).
+        let expected = env.wildcard_map_from_wildcards_regex(patterns).unwrap();
+        assert_eq!(actual.inclusions, expected.inclusions);
+        assert_eq!(actual.exclusions, expected.exclusions);
+        assert_eq!(env.from_wildcards(patterns).unwrap(), expected.resolve());
+    }
+
+    #[test]
+    fn test_builtin_pass_through_env_compiles() {
+        CompiledWildcards::compile(BUILTIN_PASS_THROUGH_ENV)
+            .expect("BUILTIN_PASS_THROUGH_ENV should compile without error");
+    }
+
+    #[test]
+    fn test_compiled_wildcards_with_excludes() {
+        let env = EnvironmentVariableMap(
+            vec![("FOO", "1"), ("FOOBAR", "2"), ("FOOD", "3"), ("BAR", "4")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        );
+
+        let patterns: &[&str] = &["FOO*", "!FOOD"];
+        let original = env.from_wildcards(patterns).unwrap();
+        let compiled = CompiledWildcards::compile(patterns).unwrap();
+        let from_compiled = env.from_compiled_wildcards(&compiled);
+
+        let mut orig_keys: Vec<_> = original.keys().cloned().collect();
+        let mut comp_keys: Vec<_> = from_compiled.keys().cloned().collect();
+        orig_keys.sort();
+        comp_keys.sort();
+
+        assert_eq!(orig_keys, comp_keys);
+        assert_eq!(orig_keys, vec!["FOO", "FOOBAR"]);
+    }
+
+    #[test]
+    fn test_compiled_wildcards_empty_patterns() {
+        let env = EnvironmentVariableMap(
+            vec![("FOO", "bar")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        );
+
+        let empty: &[&str] = &[];
+        let compiled = CompiledWildcards::compile(empty).unwrap();
+        let result = env.from_compiled_wildcards(&compiled);
+        assert!(result.is_empty(), "empty patterns should match nothing");
+    }
+}

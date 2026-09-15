@@ -1,0 +1,154 @@
+use async_graphql::Enum;
+use serde::Serialize;
+use tokio::sync::oneshot;
+
+pub enum Event {
+    LogEvent(turborepo_log::LogEvent),
+    ToggleLogPanel,
+    StartTask {
+        task: String,
+        output_logs: OutputLogs,
+    },
+    TaskOutput {
+        task: String,
+        output: Vec<u8>,
+    },
+    EndTask {
+        task: String,
+        result: TaskResult,
+    },
+    Status {
+        task: String,
+        status: String,
+        result: CacheResult,
+        /// The task's configured output verbosity. Carried here (in
+        /// addition to `StartTask`) because cache hits finish without ever
+        /// starting, and log persistence must still respect the setting.
+        output_logs: OutputLogs,
+    },
+    PaneSizeQuery(oneshot::Sender<PaneSize>),
+    Stop(oneshot::Sender<()>),
+    // Stop initiated by the TUI itself
+    InternalStop,
+    Interrupt,
+    Up,
+    Down,
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    JumpToLogsTop,
+    JumpToLogsBottom,
+    ClearLogs,
+    SetStdin {
+        task: String,
+        stdin: Box<dyn std::io::Write + Send>,
+    },
+    EnterInteractive,
+    ExitInteractive,
+    Input {
+        bytes: Vec<u8>,
+    },
+    UpdateTasks {
+        tasks: Vec<String>,
+    },
+    Mouse(crossterm::event::MouseEvent),
+    CopySelection,
+    RestartTasks {
+        tasks: Vec<String>,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    ToggleSidebar,
+    ToggleHelpPopup,
+    TogglePinnedTask,
+    /// Toggle between the TUI and streamed logs. `scope` selects whether
+    /// all tasks or only the selected task are streamed. Pressing again
+    /// while streaming returns to the TUI.
+    ToggleStream {
+        scope: StreamScope,
+    },
+    SearchEnter,
+    SearchExit {
+        restore_scroll: bool,
+    },
+    SearchLock,
+    SearchScroll {
+        direction: Direction,
+    },
+    SearchEnterChar(char),
+    SearchBackspace,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+}
+
+/// Which task output to stream when leaving the TUI for streamed logs.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StreamScope {
+    /// Stream every task's output, interleaved with per-task prefixes.
+    All,
+    /// Stream only the task that was selected in the TUI.
+    SelectedTask,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Enum)]
+pub enum TaskResult {
+    Success,
+    Failure,
+    CacheHit,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Enum)]
+pub enum CacheResult {
+    Hit,
+    Miss,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Enum)]
+pub enum OutputLogs {
+    // Entire task output is persisted after run
+    Full,
+    // None of a task output is persisted after run
+    None,
+    // Only the status line of a task is persisted
+    HashOnly,
+    // Output is only persisted if it is a cache miss
+    NewOnly,
+    // Output is only persisted if the task failed
+    ErrorsOnly,
+}
+
+impl From<turborepo_types::OutputLogsMode> for OutputLogs {
+    fn from(value: turborepo_types::OutputLogsMode) -> Self {
+        match value {
+            turborepo_types::OutputLogsMode::Full => OutputLogs::Full,
+            turborepo_types::OutputLogsMode::None => OutputLogs::None,
+            turborepo_types::OutputLogsMode::HashOnly => OutputLogs::HashOnly,
+            turborepo_types::OutputLogsMode::NewOnly => OutputLogs::NewOnly,
+            turborepo_types::OutputLogsMode::ErrorsOnly => OutputLogs::ErrorsOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn assert_event_send() {
+        fn send_sync<T: Send>() {}
+        send_sync::<Event>();
+    }
+}

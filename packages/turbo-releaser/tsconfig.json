@@ -1,0 +1,10 @@
+{
+  "extends": "@turbo/tsconfig/library.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "module": "nodenext",
+    "lib": ["ESNext"],
+    "types": ["node"],
+    "strictNullChecks": true
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "@turbo/types",
+  "version": "2.10.14-canary.1",
+  "description": "Turborepo types",
+  "homepage": "https://turborepo.dev",
+  "bugs": {
+    "url": "https://github.com/vercel/turborepo/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vercel/turborepo.git",
+    "directory": "packages/turbo-types"
+  },
+  "files": [
+    "schemas",
+    "src"
+  ],
+  "type": "commonjs",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "0.18.2",
+    "@turbo/tsconfig": "workspace:*",
+    "@types/node": "20.11.30",
+    "ts-json-schema-generator": "2.5.0",
+    "tsx": "4.21.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "typescript-7": "npm:typescript@7.0.2"
+  }
+}

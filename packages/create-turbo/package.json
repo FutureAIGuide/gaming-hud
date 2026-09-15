@@ -1,0 +1,44 @@
+{
+  "name": "create-turbo",
+  "version": "2.10.14-canary.1",
+  "description": "Create a new Turborepo",
+  "homepage": "https://turborepo.dev",
+  "bugs": {
+    "url": "https://github.com/vercel/turborepo/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel/turborepo",
+    "directory": "packages/create-turbo"
+  },
+  "bin": {
+    "create-turbo": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@inquirer/prompts": "^7.10.1",
+    "commander": "11.0.0",
+    "fs-extra": "11.1.1",
+    "picocolors": "1.0.1",
+    "semver": "7.7.3",
+    "update-check": "1.5.4"
+  },
+  "devDependencies": {
+    "@jest/globals": "30.3.0",
+    "@turbo/telemetry": "workspace:*",
+    "@turbo/test-utils": "workspace:*",
+    "@turbo/tsconfig": "workspace:*",
+    "@turbo/utils": "workspace:*",
+    "@turbo/workspaces": "workspace:*",
+    "@types/fs-extra": "9.0.13",
+    "@types/node": "18.17.4",
+    "@types/semver": "7.3.12",
+    "jest": "30.3.0",
+    "tsdown": "0.12.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "typescript-7": "npm:typescript@7.0.2"
+  }
+}

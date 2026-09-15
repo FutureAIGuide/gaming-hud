@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "baseUrl": ".",
+    "paths": {
+      "@gaming-hud/ui": ["packages/ui/src/index.ts"],
+      "@gaming-hud/core": ["packages/core/src/index.ts"],
+      "@gaming-hud/config": ["packages/config/index.ts"]
+    }
+  },
+  "include": [],
+  "references": [
+    { "path": "./packages/config" },
+    { "path": "./packages/ui" },
+    { "path": "./packages/core" },
+    { "path": "./apps/desktop" },
+    { "path": "./apps/extension" },
+    { "path": "./apps/web" }
+  ]
+}

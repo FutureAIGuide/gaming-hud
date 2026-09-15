@@ -1,0 +1,2032 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use notify::Event;
+use radix_trie::{Trie, TrieCommon};
+use thiserror::Error;
+use tokio::{
+    select,
+    sync::{broadcast, mpsc, oneshot, watch},
+};
+use tracing::{debug, trace};
+use turbopath::{AbsoluteSystemPathBuf, AnchoredSystemPath, AnchoredSystemPathBuf};
+use turborepo_repository::discovery::DiscoveryResponse;
+use turborepo_scm::{Error as SCMError, GitHashes, SCM};
+
+use crate::{
+    RepositoryIgnore, WatchInterest, WatchScope, WatchSource,
+    debouncer::Debouncer,
+    globwatcher::{GlobError, GlobSet},
+    package_watcher::DiscoveryData,
+    scm_resource::SCMResource,
+};
+
+pub struct HashWatcher {
+    _exit_tx: oneshot::Sender<()>,
+    _handle: tokio::task::JoinHandle<()>,
+    query_tx: mpsc::Sender<Query>,
+    slowest_files: Arc<turborepo_scm::SlowestFiles>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InputGlobs {
+    Default,
+    DefaultWithExtras(GlobSet),
+    Specific(GlobSet),
+}
+
+impl InputGlobs {
+    pub fn from_raw(raw: Vec<String>, include_default: bool) -> Result<Self, GlobError> {
+        if raw.is_empty() {
+            return Ok(Self::Default);
+        }
+        let glob_set = GlobSet::from_raw_unfiltered(raw)?;
+        if include_default {
+            Ok(Self::DefaultWithExtras(glob_set))
+        } else {
+            Ok(Self::Specific(glob_set))
+        }
+    }
+
+    fn is_package_local(&self) -> bool {
+        match self {
+            InputGlobs::Default => true,
+            InputGlobs::DefaultWithExtras(glob_set) => glob_set.is_package_local(),
+            InputGlobs::Specific(glob_set) => glob_set.is_package_local(),
+        }
+    }
+
+    fn as_inputs(&self) -> Vec<String> {
+        match self {
+            InputGlobs::Default => Vec::new(),
+            InputGlobs::DefaultWithExtras(glob_set) | InputGlobs::Specific(glob_set) => {
+                glob_set.as_inputs()
+            }
+        }
+    }
+
+    pub fn include_default_files(&self) -> bool {
+        match self {
+            InputGlobs::Default | InputGlobs::DefaultWithExtras(..) => true,
+            InputGlobs::Specific(..) => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HashSpec {
+    pub package_path: AnchoredSystemPathBuf,
+    pub inputs: InputGlobs,
+}
+
+impl HashSpec {
+    fn is_package_local(&self) -> bool {
+        self.inputs.is_package_local()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Package hashing encountered an error: {0}")]
+    HashingError(String),
+    #[error("File hashing is not available: {0}")]
+    Unavailable(String),
+    #[error("Package not found: {} {:?}", .0.package_path, .0.inputs)]
+    UnknownPackage(HashSpec),
+    #[error("Unsupported: glob traverses out of the package")]
+    UnsupportedGlob,
+}
+
+// Communication errors that all funnel to Unavailable
+
+impl From<watch::error::RecvError> for Error {
+    fn from(e: watch::error::RecvError) -> Self {
+        Self::Unavailable(e.to_string())
+    }
+}
+
+impl From<oneshot::error::RecvError> for Error {
+    fn from(e: oneshot::error::RecvError) -> Self {
+        Self::Unavailable(e.to_string())
+    }
+}
+
+impl<T> From<mpsc::error::SendError<T>> for Error {
+    fn from(e: mpsc::error::SendError<T>) -> Self {
+        Self::Unavailable(e.to_string())
+    }
+}
+
+impl HashWatcher {
+    pub fn new(
+        repo_root: AbsoluteSystemPathBuf,
+        package_discovery: watch::Receiver<Option<DiscoveryData>>,
+        file_events: impl Into<WatchSource>,
+        scm: SCM,
+    ) -> Self {
+        let file_events = file_events.into();
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let (query_tx, query_rx) = mpsc::channel(16);
+        // Track the slowest-to-hash files so a stalled startup (e.g. a large
+        // file dominating the initial hash) can be diagnosed via
+        // `slowest_files()`.
+        let slowest_files = Arc::new(turborepo_scm::SlowestFiles::new());
+        let scm = scm.with_slowest_files_recorder(slowest_files.clone());
+        let subscriber = Subscriber::new(repo_root, package_discovery, scm, query_rx);
+        let handle = tokio::spawn(subscriber.watch(exit_rx, file_events));
+        Self {
+            _exit_tx: exit_tx,
+            _handle: handle,
+            query_tx,
+            slowest_files,
+        }
+    }
+
+    /// Snapshot the slowest-to-hash files, slowest-first by hashing duration
+    /// (in-flight files use their elapsed-so-far). Used to diagnose a startup
+    /// that stalls on hashing a large file.
+    pub fn slowest_files(&self) -> Vec<turborepo_scm::SlowestFile> {
+        self.slowest_files.snapshot()
+    }
+
+    // Note that this does not wait for any sort of ready signal. The watching
+    // process won't respond until filewatching is ready, but there is no
+    // guarantee that package data or file hashing will be done before
+    // responding. Both package discovery and file hashing can fail depending on the
+    // state of the filesystem, so clients will need to be robust to receiving
+    // errors.
+    pub async fn get_file_hashes(&self, hash_spec: HashSpec) -> Result<Arc<GitHashes>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.query_tx.send(Query::GetHash(hash_spec, tx)).await?;
+        rx.await?
+    }
+
+    /// Replace the package paths supplied by the repository graph.
+    ///
+    /// Package discovery only reports JavaScript workspaces. The repository
+    /// graph also knows about native execution scopes, so watch mode registers
+    /// those paths here to make their content hashes available for
+    /// deduplication.
+    pub async fn set_package_paths(
+        &self,
+        package_paths: HashSet<AnchoredSystemPathBuf>,
+    ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.query_tx
+            .send(Query::SetPackagePaths(package_paths, tx))
+            .await?;
+        rx.await?;
+        Ok(())
+    }
+}
+
+struct Subscriber {
+    repo_root: AbsoluteSystemPathBuf,
+    package_discovery: watch::Receiver<Option<DiscoveryData>>,
+    query_rx: mpsc::Receiver<Query>,
+    scm: SCMResource,
+    next_version: AtomicUsize,
+}
+
+#[derive(Debug)]
+enum Query {
+    GetHash(HashSpec, oneshot::Sender<Result<Arc<GitHashes>, Error>>),
+    SetPackagePaths(HashSet<AnchoredSystemPathBuf>, oneshot::Sender<()>),
+}
+
+// Version is a type that exists to stamp an asynchronous hash computation
+// with a version so that we can ignore completion of outdated hash
+// computations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Version(usize);
+
+enum HashState {
+    Hashes(Arc<GitHashes>),
+    Pending {
+        version: Version,
+        debouncer: Arc<Debouncer>,
+        txs: Vec<oneshot::Sender<Result<Arc<GitHashes>, Error>>>,
+        rerun_after_current: bool,
+    },
+    Unavailable(String),
+}
+// We use a radix_trie to store hashes so that we can quickly match a file path
+// to a package without having to iterate over the set of all packages. We
+// expect file changes to be the highest volume of events that this service
+// handles, so we want to ensure we're efficient in deciding if a given change
+// is relevant or not.
+//
+// Our Trie keys off of a String because of the orphan rule. Keys are required
+// to be TrieKey, but this crate doesn't own TrieKey or AnchoredSystemPathBuf.
+// We *could* implement TrieKey in AnchoredSystemPathBuf and avoid the String
+// conversion, if we decide we want to add the radix_trie dependency to
+// turbopath.
+struct FileHashes(Trie<String, HashMap<InputGlobs, HashState>>);
+
+struct PackageWatchScope {
+    inputs: HashSet<InputGlobs>,
+}
+
+struct WatchScopeState {
+    initialized: bool,
+    packages: Trie<String, PackageWatchScope>,
+}
+
+impl Default for WatchScopeState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            packages: Trie::new(),
+        }
+    }
+}
+
+struct DynamicWatchScope {
+    repo_root: AbsoluteSystemPathBuf,
+    state: Arc<RwLock<WatchScopeState>>,
+    physical_interest: WatchInterest,
+}
+
+impl DynamicWatchScope {
+    fn new(
+        repo_root: AbsoluteSystemPathBuf,
+        repository_ignore: RepositoryIgnore,
+    ) -> (Self, WatchScope) {
+        let state = Arc::new(RwLock::new(WatchScopeState::default()));
+        let dynamic = Self {
+            repo_root: repo_root.clone(),
+            state: state.clone(),
+            physical_interest: WatchInterest::new(),
+        };
+        let physical_interest = dynamic.physical_interest.clone();
+        let scope = WatchScope::predicate(move |path| {
+            let Ok(absolute_path) = AbsoluteSystemPathBuf::try_from(path) else {
+                return true;
+            };
+            let Ok(path) = repo_root.anchor(&absolute_path) else {
+                return false;
+            };
+            let state = state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.initialized {
+                // Subscribe conservatively until package discovery has been applied, avoiding
+                // a gap between subscription creation and the first dynamic scope update.
+                return repository_ignore.is_relevant(absolute_path.as_std_path(), false);
+            }
+            let Some(package_trie) = state.packages.get_ancestor(path.as_str()) else {
+                return false;
+            };
+            let Some(package) = package_trie.value() else {
+                return false;
+            };
+            let Some(package_path) = package_trie
+                .key()
+                .and_then(|path| AnchoredSystemPath::new(path).ok())
+            else {
+                return false;
+            };
+            let Some(path_in_package) = path.strip_prefix(package_path) else {
+                return false;
+            };
+            let path_in_package = path_in_package.to_unix();
+            let default_relevant =
+                repository_ignore.is_relevant(absolute_path.as_std_path(), false);
+
+            package.inputs.iter().any(|inputs| match inputs {
+                InputGlobs::Default => default_relevant,
+                InputGlobs::DefaultWithExtras(globs) => {
+                    globs.matches(&path_in_package) || default_relevant
+                }
+                InputGlobs::Specific(globs) => globs.matches(&path_in_package),
+            })
+        })
+        .with_physical_interest(physical_interest);
+        (dynamic, scope)
+    }
+
+    /// Replace the complete scope after package discovery changes the
+    /// repository layout. Queries should use `insert` so adding N input
+    /// specs remains O(N).
+    fn replace(&self, hashes: &FileHashes) {
+        let mut packages = Trie::new();
+        for package_path in hashes.0.keys() {
+            let Some(states) = hashes.0.get(package_path) else {
+                continue;
+            };
+            let package = PackageWatchScope {
+                inputs: states.keys().cloned().collect(),
+            };
+            packages.insert(package_path.clone(), package);
+        }
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = WatchScopeState {
+            initialized: true,
+            packages,
+        };
+
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.physical_interest
+            .replace(state.packages.iter().flat_map(|(package_path, package)| {
+                let package_root = self.repo_root.as_std_path().join(package_path);
+                package.inputs.iter().flat_map(move |inputs| match inputs {
+                    InputGlobs::Default => Vec::new(),
+                    InputGlobs::DefaultWithExtras(globs) | InputGlobs::Specific(globs) => globs
+                        .literal_prefixes()
+                        .map(|prefix| package_root.join(prefix))
+                        .collect(),
+                })
+            }));
+    }
+
+    fn insert(&self, spec: &HashSpec) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(package) = state.packages.get_mut(spec.package_path.as_str()) {
+            package.inputs.insert(spec.inputs.clone());
+        } else {
+            state.packages.insert(
+                spec.package_path.as_str().to_owned(),
+                PackageWatchScope {
+                    inputs: HashSet::from([spec.inputs.clone()]),
+                },
+            );
+        }
+    }
+
+    fn prepare_spec(&self, spec: &HashSpec) {
+        let package_root = self
+            .repo_root
+            .as_std_path()
+            .join(spec.package_path.as_str());
+        let paths = match &spec.inputs {
+            InputGlobs::Default => Vec::new(),
+            InputGlobs::DefaultWithExtras(globs) | InputGlobs::Specific(globs) => globs
+                .literal_prefixes()
+                .map(|prefix| package_root.join(prefix))
+                .collect(),
+        };
+        self.physical_interest.extend(paths);
+    }
+
+    async fn flush(&self) {
+        self.physical_interest.flush().await;
+    }
+}
+
+impl FileHashes {
+    fn new() -> Self {
+        Self(Trie::new())
+    }
+
+    fn drop_matching<F>(&mut self, mut f: F, reason: &str)
+    where
+        F: FnMut(&AnchoredSystemPath) -> bool,
+    {
+        let mut previous = std::mem::take(&mut self.0);
+
+        // radix_trie doesn't have an into_iter() implementation, so we have a slightly
+        // inefficient method for removing matching values. Fortunately, we only
+        // need to do this when the package layout changes. It's O(n) in the
+        // number of packages, on top of the trie internals.
+        let keys = previous.keys().map(|k| k.to_owned()).collect::<Vec<_>>();
+        for key in keys {
+            let Some(previous_value) = previous.remove(&key) else {
+                continue;
+            };
+            let Ok(path_key) = AnchoredSystemPath::new(&key) else {
+                self.0.insert(key, previous_value);
+                continue;
+            };
+            if !f(path_key) {
+                // keep it, we didn't match the key.
+                self.0.insert(key, previous_value);
+            } else {
+                for state in previous_value.into_values() {
+                    if let HashState::Pending { txs, .. } = state {
+                        for tx in txs {
+                            let _ = tx.send(Err(Error::Unavailable(reason.to_string())));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_changed_specs(&self, file_path: &AnchoredSystemPath) -> HashSet<HashSpec> {
+        self.0
+            .get_ancestor(file_path.as_str())
+            // verify we have a key
+            .and_then(|subtrie| subtrie.key().map(|key| (key, subtrie)))
+            // convert key to AnchoredSystemPath, and verify we have a value
+            .and_then(|(package_path, subtrie)| {
+                let Ok(package_path) = AnchoredSystemPath::new(package_path) else {
+                    return None;
+                };
+                // handle scenarios where even though we've found an ancestor, it might be a
+                // sibling file or directory that starts with the same prefix,
+                // e,g an update to apps/foo_decoy when the package path is
+                // apps/foo.
+                if let Some(package_path_to_file) = file_path.strip_prefix(package_path) {
+                    // Pass along the path to the package, the path _within_ the package to this
+                    // change, in unix format, and the set of input specs that
+                    // we're tracking.
+                    subtrie
+                        .value()
+                        .map(|specs| (package_path, package_path_to_file.to_unix(), specs))
+                } else {
+                    None
+                }
+            })
+            // now that we have a path and a set of specs, filter the specs to the relevant ones
+            .map(|(package_path, change_in_package, input_globs)| {
+                input_globs
+                    .keys()
+                    .filter_map(|input_globs| match input_globs {
+                        InputGlobs::Default => Some(HashSpec {
+                            package_path: package_path.to_owned(),
+                            inputs: InputGlobs::Default,
+                        }),
+                        inputs @ InputGlobs::DefaultWithExtras(_) => Some(HashSpec {
+                            package_path: package_path.to_owned(),
+                            inputs: inputs.clone(),
+                        }),
+                        inputs @ InputGlobs::Specific(glob_set)
+                            if glob_set.matches(&change_in_package) =>
+                        {
+                            Some(HashSpec {
+                                package_path: package_path.to_owned(),
+                                inputs: inputs.clone(),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn drain(&mut self, reason: &str) {
+        // funnel through drop_matching even though we could just swap with a new trie.
+        // We want to ensure we respond to any pending queries.
+        self.drop_matching(|_| true, reason);
+    }
+
+    fn contains_key(&self, key: &HashSpec) -> bool {
+        self.0
+            .get(key.package_path.as_str())
+            .and_then(|states| states.get(&key.inputs))
+            .is_some()
+    }
+
+    fn insert(&mut self, key: HashSpec, value: HashState) {
+        if let Some(states) = self.0.get_mut(key.package_path.as_str()) {
+            states.insert(key.inputs, value);
+        } else {
+            let mut states = HashMap::new();
+            states.insert(key.inputs, value);
+            self.0.insert(key.package_path.as_str().to_owned(), states);
+        }
+    }
+
+    fn get_mut(&mut self, key: &HashSpec) -> Option<&mut HashState> {
+        self.0
+            .get_mut(key.package_path.as_str())
+            .and_then(|states| states.get_mut(&key.inputs))
+    }
+}
+
+struct HashUpdate {
+    spec: HashSpec,
+    version: Version,
+    result: Result<GitHashes, SCMError>,
+}
+
+impl Subscriber {
+    fn new(
+        repo_root: AbsoluteSystemPathBuf,
+        package_discovery: watch::Receiver<Option<DiscoveryData>>,
+        scm: SCM,
+        query_rx: mpsc::Receiver<Query>,
+    ) -> Self {
+        Self {
+            repo_root,
+            package_discovery,
+            scm: SCMResource::new(scm),
+            query_rx,
+            next_version: AtomicUsize::new(0),
+        }
+    }
+
+    async fn watch(mut self, mut exit_rx: oneshot::Receiver<()>, file_events: WatchSource) {
+        debug!("starting file hash watcher");
+        let repository_ignore = file_events
+            .repository_ignore()
+            .unwrap_or_else(|| RepositoryIgnore::new(self.repo_root.as_std_path()));
+        let (dynamic_scope, scope) =
+            DynamicWatchScope::new(self.repo_root.clone(), repository_ignore);
+        let mut file_events_recv = match file_events.subscribe(scope).await {
+            Ok(subscription) => subscription,
+            Err(e) => {
+                debug!("file hash watcher exited: {:?}", e);
+                return;
+            }
+        };
+        let (hash_update_tx, mut hash_update_rx) = mpsc::channel::<HashUpdate>(16);
+        let mut hashes = FileHashes::new();
+        let mut graph_package_paths = HashSet::new();
+
+        let mut package_data = self.package_discovery.borrow().to_owned();
+        self.handle_package_data_update(
+            &package_data,
+            &graph_package_paths,
+            &mut hashes,
+            &hash_update_tx,
+        );
+        dynamic_scope.replace(&hashes);
+        let mut package_discovery_open = true;
+        // We've gotten the ready signal from filewatching, and *some* state from
+        // package discovery, but there is no guarantee that package discovery
+        // is ready. This means that initial queries may be returned with errors
+        // until we've completed package discovery and then hashing.
+        //
+        // This is the main event loop for the hash watcher. It receives file events,
+        // updates to the package discovery state, and queries for hashes. It does
+        // not use filesystem cookies, as it is expected that the client will
+        // synchronize itself first before issuing a series of queries, one per
+        // task that in the task graph for a run, and we don't want to block on
+        // the filesystem for each query. This is analogous to running without
+        // the daemon, where we assume a static filesystem for the duration of
+        // generating task hashes.
+        loop {
+            select! {
+                biased;
+                _ = &mut exit_rx => {
+                    debug!("file hash watcher exited");
+                    return;
+                },
+                package_discovery_result = self.package_discovery.changed(), if package_discovery_open => {
+                    if package_discovery_result.is_ok() {
+                        self.package_discovery.borrow().clone_into(&mut package_data);
+                        self.handle_package_data_update(
+                            &package_data,
+                            &graph_package_paths,
+                            &mut hashes,
+                            &hash_update_tx,
+                        );
+                        dynamic_scope.replace(&hashes);
+                    } else {
+                        // `changed()` remains immediately ready after all senders are dropped.
+                        // Disable this biased branch so it cannot starve the remaining inputs,
+                        // while retaining the most recently observed package and hash state.
+                        package_discovery_open = false;
+                    }
+                },
+                file_event = file_events_recv.recv() => {
+                    match file_event {
+                        Ok(Ok(event)) => {
+                            if event
+                                .paths
+                                .iter()
+                                .any(|path| AbsoluteSystemPathBuf::try_from(path.as_path()).is_err())
+                            {
+                                self.flush_and_rehash(
+                                    &mut hashes,
+                                    &hash_update_tx,
+                                    &package_data,
+                                    &graph_package_paths,
+                                    "non-UTF-8 file event",
+                                );
+                            } else {
+                                self.handle_file_event(event, &mut hashes, &hash_update_tx);
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            debug!("file watcher error: {:?}", e);
+                            self.flush_and_rehash(&mut hashes, &hash_update_tx, &package_data, &graph_package_paths, &format!("file watcher error: {e}"));
+                        },
+                        Err(broadcast::error::RecvError::Closed) => {
+                            debug!("file watcher closed");
+                            hashes.drain("file watcher closed");
+                            return;
+                        },
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            debug!("file watcher lagged");
+                            self.flush_and_rehash(&mut hashes, &hash_update_tx, &package_data, &graph_package_paths, "file watcher lagged");
+                        },
+                    }
+                },
+                hash_update = hash_update_rx.recv() => {
+                    if let Some(hash_update) = hash_update {
+                        self.handle_hash_update(hash_update, &mut hashes, &hash_update_tx);
+                    } else {
+                        // note that we only ever lend out hash_update_tx, so this should be impossible
+                        unreachable!("hash update channel closed, but we have a live reference to it");
+                    }
+                },
+                Some(query) = self.query_rx.recv() => {
+                    self.handle_query(
+                        query,
+                        &package_data,
+                        &mut graph_package_paths,
+                        &mut hashes,
+                        &hash_update_tx,
+                        &dynamic_scope,
+                    ).await;
+                }
+            }
+        }
+    }
+
+    fn flush_and_rehash(
+        &self,
+        hashes: &mut FileHashes,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+        package_data: &Option<Result<DiscoveryResponse, String>>,
+        graph_package_paths: &HashSet<AnchoredSystemPathBuf>,
+        reason: &str,
+    ) {
+        // We need to send errors to any RPCs that are pending, and having an empty set
+        // of hashes will cause handle_package_data_update to consider all
+        // packages as new and rehash them.
+        hashes.drain(reason);
+        self.handle_package_data_update(package_data, graph_package_paths, hashes, hash_update_tx);
+    }
+
+    // Queries retrieve hashes and synchronize the repository graph's package paths.
+    async fn handle_query(
+        &self,
+        query: Query,
+        package_data: &Option<Result<DiscoveryResponse, String>>,
+        graph_package_paths: &mut HashSet<AnchoredSystemPathBuf>,
+        hashes: &mut FileHashes,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+        dynamic_scope: &DynamicWatchScope,
+    ) {
+        //trace!("handling query {query:?}");
+        match query {
+            Query::GetHash(spec, tx) => {
+                // We don't currently support inputs that are not package-local. Adding this
+                // support would require tracking arbitrary file paths and
+                // mapping them back to packages. It is doable if we want to
+                // attempt it in the future.
+                if !spec.is_package_local() {
+                    let _ = tx.send(Err(Error::UnsupportedGlob));
+                    trace!("unsupported glob in query {:?}", spec);
+                    return;
+                }
+                if let Some(state) = hashes.get_mut(&spec) {
+                    match state {
+                        HashState::Hashes(hashes) => {
+                            let _ = tx.send(Ok(Arc::clone(hashes)));
+                        }
+                        HashState::Pending { txs, .. } => {
+                            txs.push(tx);
+                        }
+                        HashState::Unavailable(e) => {
+                            let _ = tx.send(Err(Error::HashingError(e.clone())));
+                        }
+                    }
+                } else if !matches!(spec.inputs, InputGlobs::Default)
+                    && hashes.contains_key(&HashSpec {
+                        package_path: spec.package_path.clone(),
+                        inputs: InputGlobs::Default,
+                    })
+                {
+                    // in this scenario, we know the package exists, but we aren't tracking these
+                    // particular inputs. Queue a hash request for them.
+                    //
+                    // Ensure ignored literal roots are physically watched and the logical scope
+                    // includes the spec before taking its baseline hash. This closes the window
+                    // in which a change after the baseline could otherwise be filtered out.
+                    dynamic_scope.prepare_spec(&spec);
+                    dynamic_scope.flush().await;
+                    dynamic_scope.insert(&spec);
+                    let (version, debouncer) = self.queue_package_hash(&spec, hash_update_tx, true);
+                    // this request will likely time out. However, if the client has asked for
+                    // this spec once, they might ask again, and we can start tracking it.
+                    hashes.insert(
+                        spec,
+                        HashState::Pending {
+                            version,
+                            debouncer,
+                            txs: vec![tx],
+                            rerun_after_current: false,
+                        },
+                    );
+                } else {
+                    // We don't know anything about this package.
+                    let _ = tx.send(Err(Error::UnknownPackage(spec)));
+                }
+            }
+            Query::SetPackagePaths(package_paths, tx) => {
+                *graph_package_paths = package_paths;
+                self.handle_package_data_update(
+                    package_data,
+                    graph_package_paths,
+                    hashes,
+                    hash_update_tx,
+                );
+                dynamic_scope.replace(hashes);
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn handle_hash_update(
+        &self,
+        update: HashUpdate,
+        hashes: &mut FileHashes,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+    ) {
+        let HashUpdate {
+            spec,
+            version,
+            result,
+        } = update;
+        // If we have a pending hash computation, update the state. If we don't, ignore
+        // this update
+        if let Some(state) = hashes.get_mut(&spec) {
+            // We need mutable access to 'state' to update it, as well as being able to
+            // extract the pending state, so we need two separate if statements
+            // to pull the value apart.
+            if let HashState::Pending {
+                version: existing_version,
+                txs: pending_queries,
+                rerun_after_current,
+                ..
+            } = state
+                && *existing_version == version
+            {
+                if *rerun_after_current {
+                    let (new_version, new_debouncer) =
+                        self.queue_package_hash(&spec, hash_update_tx, false);
+                    let mut txs = Vec::new();
+                    std::mem::swap(pending_queries, &mut txs);
+                    *state = HashState::Pending {
+                        version: new_version,
+                        debouncer: new_debouncer,
+                        txs,
+                        rerun_after_current: false,
+                    };
+                    return;
+                }
+                match result {
+                    Ok(hashes) => {
+                        let hashes = Arc::new(hashes);
+                        for pending_query in pending_queries.drain(..) {
+                            // We don't care if the client has gone away
+                            let _ = pending_query.send(Ok(Arc::clone(&hashes)));
+                        }
+                        *state = HashState::Hashes(hashes);
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        for pending_query in pending_queries.drain(..) {
+                            // We don't care if the client has gone away
+                            let _ = pending_query.send(Err(Error::HashingError(error.clone())));
+                        }
+                        *state = HashState::Unavailable(error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn queue_package_hash(
+        &self,
+        spec: &HashSpec,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+        immediate: bool,
+    ) -> (Version, Arc<Debouncer>) {
+        let (versions, debouncer) =
+            self.queue_package_hashes_batch(vec![spec.clone()], hash_update_tx, immediate);
+        // The batch always returns one version per queued spec.
+        let Some(version) = versions.into_iter().next() else {
+            unreachable!("one version per queued spec");
+        };
+        (version, debouncer)
+    }
+
+    /// Queues one debounced hashing task for several input specs of the same
+    /// package. A freshly built repo index is shared across all of them: one
+    /// read of git state instead of a `git ls-tree` + `git status` subprocess
+    /// pair per spec, and clean files reuse committed blob hashes instead of
+    /// being re-hashed per spec. If the index build fails, each spec falls
+    /// back to per-package hashing exactly as before.
+    fn queue_package_hashes_batch(
+        &self,
+        specs: Vec<HashSpec>,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+        immediate: bool,
+    ) -> (Vec<Version>, Arc<Debouncer>) {
+        let versions: Vec<Version> = specs
+            .iter()
+            .map(|_| Version(self.next_version.fetch_add(1, Ordering::SeqCst)))
+            .collect();
+        let task_versions = versions.clone();
+        let tx = hash_update_tx.clone();
+        let repo_root = self.repo_root.clone();
+        let scm = self.scm.clone();
+        let debouncer = if immediate {
+            Debouncer::new(Duration::from_millis(0))
+        } else {
+            Debouncer::default()
+        };
+        let debouncer = Arc::new(debouncer);
+        let debouncer_copy = debouncer.clone();
+        tokio::task::spawn(async move {
+            debouncer_copy.debounce().await;
+            let scm_permit = scm.acquire_scm().await;
+            // We awkwardly copy the actual SCM instance since we're sending it to a
+            // different thread which requires it be 'static.
+            let scm_instance = scm_permit.clone();
+            // Package hashing involves blocking IO calls, so run on a blocking thread.
+            let blocking_handle = tokio::task::spawn_blocking(move || {
+                let batch_packages: Vec<_> = specs.iter().map(|s| s.package_path.clone()).collect();
+                let index = scm_instance.build_repo_index_for_packages(&repo_root, &batch_packages);
+                for (spec, version) in specs.into_iter().zip(task_versions) {
+                    let telemetry = None;
+                    let inputs = spec.inputs.as_inputs();
+                    let result = scm_instance.get_package_file_hashes(
+                        &repo_root,
+                        &spec.package_path,
+                        &inputs,
+                        spec.inputs.include_default_files(),
+                        telemetry,
+                        index.as_ref(),
+                    );
+                    trace!("hashing complete for {:?}", spec);
+                    if tx
+                        .blocking_send(HashUpdate {
+                            spec,
+                            version,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            // We wait for the git task to finish so `scm_permit` only gets dropped once the
+            // resource is no longer being used.
+            // We should not shut down if a SCM task panics
+            blocking_handle.await.ok();
+        });
+        (versions, debouncer)
+    }
+
+    fn handle_file_event(
+        &self,
+        event: Event,
+        hashes: &mut FileHashes,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+    ) {
+        let mut changed_specs: HashSet<HashSpec> = HashSet::new();
+        for path in event.paths {
+            let Ok(path) = AbsoluteSystemPathBuf::try_from(path) else {
+                continue;
+            };
+            let Ok(repo_relative_change_path) = self.repo_root.anchor(&path) else {
+                continue;
+            };
+            // If this change is not relevant to a package, ignore it
+            trace!("file change at {:?}", repo_relative_change_path);
+            let changed_specs_for_path = hashes.get_changed_specs(&repo_relative_change_path);
+            if !changed_specs_for_path.is_empty() {
+                // We have a file change in a package, and we haven't seen this package yet.
+                // Queue it for rehashing.
+                // TODO: further qualification. Which sets of inputs? Is this file .gitignored?
+                // We are somewhat saved here by deferring to the SCM to do the hashing. A
+                // change to a gitignored file will trigger a re-hash, but won't
+                // actually affect what the hash is.
+                trace!("specs changed: {:?}", changed_specs_for_path);
+                //changed_specs.insert(package_path.to_owned());
+                changed_specs.extend(changed_specs_for_path);
+            } else {
+                trace!("Ignoring change to {repo_relative_change_path}");
+            }
+        }
+        // TODO: handle different sets of inputs
+
+        // Any rehashing we do was triggered by a file event, so don't do it
+        // immediately. Wait for the debouncer to time out instead.
+        let immediate = false;
+        // New specs are batched per package so that one file event matching
+        // several overlapping input specs shares one git-state read.
+        let mut new_specs_by_package: HashMap<_, Vec<HashSpec>> = HashMap::new();
+        for spec in changed_specs {
+            match hashes.get_mut(&spec) {
+                // Technically this shouldn't happen, the package_paths are sourced from keys in
+                // hashes.
+                None => {
+                    new_specs_by_package
+                        .entry(spec.package_path.clone())
+                        .or_default()
+                        .push(spec);
+                }
+                Some(entry) => {
+                    if let HashState::Pending {
+                        debouncer,
+                        rerun_after_current,
+                        ..
+                    } = entry
+                    {
+                        if !debouncer.bump() {
+                            // The hash is already in progress. Let it finish and run one
+                            // follow-up hash instead of starting parallel hashes for the same spec.
+                            *rerun_after_current = true;
+                        }
+                    } else {
+                        // it's not a pending hash calculation, overwrite the entry with a new
+                        // pending calculation
+                        let (version, debouncer) =
+                            self.queue_package_hash(&spec, hash_update_tx, immediate);
+                        *entry = HashState::Pending {
+                            version,
+                            debouncer,
+                            txs: vec![],
+                            rerun_after_current: false,
+                        };
+                    }
+                }
+            }
+        }
+
+        for (_package_path, specs) in new_specs_by_package {
+            let (versions, debouncer) =
+                self.queue_package_hashes_batch(specs.clone(), hash_update_tx, immediate);
+            for (spec, version) in specs.into_iter().zip(versions) {
+                hashes.insert(
+                    spec,
+                    HashState::Pending {
+                        version,
+                        debouncer: debouncer.clone(),
+                        txs: vec![],
+                        rerun_after_current: false,
+                    },
+                );
+            }
+        }
+    }
+
+    fn handle_package_data_update(
+        &self,
+        package_data: &Option<Result<DiscoveryResponse, String>>,
+        graph_package_paths: &HashSet<AnchoredSystemPathBuf>,
+        hashes: &mut FileHashes,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+    ) {
+        debug!("handling package data {:?}", package_data);
+        let mut package_paths = graph_package_paths.clone();
+        if let Some(Ok(data)) = package_data {
+            package_paths.extend(
+                data.workspaces
+                    .iter()
+                    .filter_map(|ws| self.repo_root.anchor(ws.workspace_root()).ok()),
+            );
+        } else if package_paths.is_empty() {
+            hashes.drain("package discovery is unavailable");
+            return;
+        }
+
+        // Reconcile JavaScript discovery with all execution scopes observed by the
+        // repository graph (including Cargo and Python packages).
+        hashes.drop_matching(
+            |package_path| !package_paths.contains(package_path),
+            "package was removed",
+        );
+        // Package data updates are triggered by file events, so don't immediately
+        // start rehashing, use the debouncer to wait for a quiet period.
+        let immediate = false;
+        for package_path in package_paths {
+            let spec = HashSpec {
+                package_path,
+                inputs: InputGlobs::Default,
+            };
+            if !hashes.contains_key(&spec) {
+                let (version, debouncer) =
+                    self.queue_package_hash(&spec, hash_update_tx, immediate);
+                hashes.insert(
+                    spec,
+                    HashState::Pending {
+                        version,
+                        debouncer,
+                        txs: vec![],
+                        rerun_after_current: false,
+                    },
+                );
+            }
+        }
+        tracing::debug!(
+            ?package_data,
+            ?graph_package_paths,
+            "updated hash watcher package paths"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        assert_matches,
+        collections::HashSet,
+        process::Command,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use tempfile::{TempDir, tempdir};
+    use turbopath::{
+        AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPathBuf, RelativeUnixPathBuf,
+    };
+    use turborepo_scm::{GitHashes, OidHash, SCM};
+
+    use super::{DynamicWatchScope, FileHashes, HashState, Query, Subscriber, Version};
+    use crate::{
+        FileSystemWatcher, RepositoryIgnore, WatchSource,
+        cookies::CookieWriter,
+        debouncer::Debouncer,
+        globwatcher::GlobSet,
+        hash_watcher::{HashSpec, HashWatcher, InputGlobs},
+        package_watcher::PackageWatcher,
+    };
+
+    fn commit_all(repo_root: &AbsoluteSystemPath) {
+        let status = Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add failed");
+
+        let status = Command::new("git")
+            .args(["commit", "-m", "Commit", "--allow-empty"])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit failed");
+    }
+
+    fn setup_fixture() -> (TempDir, AbsoluteSystemPathBuf) {
+        let tmp = tempdir().unwrap();
+        let repo_root = AbsoluteSystemPathBuf::try_from(tmp.path())
+            .unwrap()
+            .to_realpath()
+            .unwrap();
+        let status = Command::new("git")
+            .args(["init"])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let status = Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config user.name failed");
+
+        let status = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config user.email failed");
+        // Setup npm workspaces, .gitignore for dist/ and two packages, one with a
+        // nested .gitignore
+        //
+        // <repo_root>
+        // ├── .gitignore (ignore dist/)
+        // ├── package.json
+        // ├── package-lock.json
+        // ├── packages
+        // │   ├── foo
+        // │   │   ├── .gitignore (ignore out/)
+        // │   │   ├── package.json
+        // │   │   ├── foo-file
+        // │   │   ├── dist
+        // │   │   └── out
+        // |   |── bar
+        // |   |   ├── package.json
+        // │   │   ├── dist
+        // │   │   └── bar-file
+        repo_root
+            .join_component(".gitignore")
+            .create_with_contents("dist/\n")
+            .unwrap();
+        repo_root
+            .join_component("package.json")
+            .create_with_contents(
+                r#"{"workspaces": ["packages/*"], "packageManager": "npm@10.0.0"}"#,
+            )
+            .unwrap();
+        repo_root
+            .join_component("package-lock.json")
+            .create_with_contents("{}")
+            .unwrap();
+        let packages = repo_root.join_component("packages");
+
+        let foo_dir = packages.join_component("foo");
+        foo_dir.join_component("out").create_dir_all().unwrap();
+        foo_dir.join_component("dist").create_dir_all().unwrap();
+        foo_dir
+            .join_component(".gitignore")
+            .create_with_contents("out/\n")
+            .unwrap();
+        foo_dir
+            .join_component("package.json")
+            .create_with_contents(r#"{"name": "foo"}"#)
+            .unwrap();
+        foo_dir
+            .join_component("foo-file")
+            .create_with_contents("foo file contents")
+            .unwrap();
+
+        let bar_dir = packages.join_component("bar");
+        bar_dir.join_component("dist").create_dir_all().unwrap();
+        bar_dir
+            .join_component("package.json")
+            .create_with_contents(r#"{"name": "bar"}"#)
+            .unwrap();
+        bar_dir
+            .join_component("bar-file")
+            .create_with_contents("bar file contents")
+            .unwrap();
+        commit_all(&repo_root);
+
+        (tmp, repo_root)
+    }
+
+    fn create_fixture_branch(repo_root: &AbsoluteSystemPath) {
+        // create a branch that deletes bar-file and adds baz-file to the bar package
+        let bar_dir = repo_root.join_components(&["packages", "bar"]);
+        bar_dir.join_component("bar-file").remove().unwrap();
+        bar_dir
+            .join_component("baz-file")
+            .create_with_contents("baz file contents")
+            .unwrap();
+
+        let status = Command::new("git")
+            .args(["branch", "test-branch"])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git branch failed");
+
+        let status = Command::new("git")
+            .args(["checkout", "test-branch"])
+            .current_dir(repo_root.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git checkout failed");
+
+        commit_all(repo_root);
+    }
+
+    #[test]
+    fn dynamic_watch_scope_inserts_hash_specs_incrementally() {
+        let (_tmp, repo_root) = setup_fixture();
+        let foo_path = AnchoredSystemPathBuf::from_raw("packages/foo").unwrap();
+        let bar_path = AnchoredSystemPathBuf::from_raw("packages/bar").unwrap();
+        let mut hashes = FileHashes::new();
+        for package_path in [foo_path.clone(), bar_path.clone()] {
+            hashes.insert(
+                HashSpec {
+                    package_path,
+                    inputs: InputGlobs::Default,
+                },
+                HashState::Unavailable("test".to_owned()),
+            );
+        }
+
+        let (scope, _watch_scope) = DynamicWatchScope::new(
+            repo_root.clone(),
+            RepositoryIgnore::new(repo_root.as_std_path()),
+        );
+        scope.replace(&hashes);
+
+        let inputs =
+            InputGlobs::Specific(GlobSet::from_raw_unfiltered(vec!["out/**".to_owned()]).unwrap());
+        scope.insert(&HashSpec {
+            package_path: foo_path.clone(),
+            inputs: inputs.clone(),
+        });
+
+        let state = scope
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state
+                .packages
+                .get(foo_path.as_str())
+                .unwrap()
+                .inputs
+                .contains(&inputs)
+        );
+        assert_eq!(
+            state.packages.get(bar_path.as_str()).unwrap().inputs.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_graph_package_paths_are_hashable_without_js_discovery() {
+        let (_tmp, repo_root) = setup_fixture();
+        let native_dir = repo_root.join_components(&["crates", "native"]);
+        native_dir.create_dir_all().unwrap();
+        native_dir
+            .join_component("Cargo.toml")
+            .create_with_contents("[package]\nname = \"native\"\nversion = \"0.1.0\"\n")
+            .unwrap();
+        let source = native_dir.join_components(&["src", "lib.rs"]);
+        source.ensure_dir().unwrap();
+        source
+            .create_with_contents("pub fn value() -> u8 { 1 }\n")
+            .unwrap();
+        commit_all(&repo_root);
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+        let (_package_discovery_tx, package_discovery_rx) = tokio::sync::watch::channel(None);
+        let hash_watcher = HashWatcher::new(
+            repo_root.clone(),
+            package_discovery_rx,
+            watcher.watch(),
+            SCM::new(&repo_root),
+        );
+        let native_path = repo_root.anchor(&native_dir).unwrap();
+        hash_watcher
+            .set_package_paths(HashSet::from([native_path.clone()]))
+            .await
+            .unwrap();
+
+        let spec = HashSpec {
+            package_path: native_path.clone(),
+            inputs: InputGlobs::Default,
+        };
+        let hashes = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(hashes) = hash_watcher.get_file_hashes(spec.clone()).await {
+                    break hashes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("repository graph package path should become hashable");
+        assert!(hashes.contains_key(&RelativeUnixPathBuf::new("Cargo.toml").unwrap()));
+        assert!(hashes.contains_key(&RelativeUnixPathBuf::new("src/lib.rs").unwrap()));
+
+        hash_watcher
+            .set_package_paths(HashSet::new())
+            .await
+            .unwrap();
+        assert_matches!(
+            hash_watcher.get_file_hashes(spec).await,
+            Err(crate::hash_watcher::Error::UnknownPackage(unknown_spec))
+                if unknown_spec.package_path == native_path
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_basic_file_changes() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        let foo_path = repo_root.join_components(&["packages", "foo"]);
+        // We need to give filewatching time to do the initial scan,
+        // but this should resolve in short order to the expected value.
+        retry_get_hash(
+            &hash_watcher,
+            HashSpec {
+                package_path: repo_root.anchor(&foo_path).unwrap(),
+                inputs: InputGlobs::Default,
+            },
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+            ]),
+        )
+        .await;
+
+        // update foo-file
+        let foo_file_path = repo_root.join_components(&["packages", "foo", "foo-file"]);
+        foo_file_path
+            .create_with_contents("new foo-file contents")
+            .unwrap();
+        retry_get_hash(
+            &hash_watcher,
+            HashSpec {
+                package_path: repo_root.anchor(&foo_path).unwrap(),
+                inputs: InputGlobs::Default,
+            },
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "5f6796bbd23dcdc9d30d07a2d8a4817c34b7f1e7"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+            ]),
+        )
+        .await;
+
+        // update files in dist/ and out/ and foo-file
+        // verify we don't get hashes for the gitignored files
+        repo_root
+            .join_components(&["packages", "foo", "out", "some-file"])
+            .create_with_contents("an ignored file")
+            .unwrap();
+        repo_root
+            .join_components(&["packages", "foo", "dist", "some-other-file"])
+            .create_with_contents("an ignored file")
+            .unwrap();
+        foo_file_path
+            .create_with_contents("even more foo-file contents")
+            .unwrap();
+        retry_get_hash(
+            &hash_watcher,
+            HashSpec {
+                package_path: repo_root.anchor(&foo_path).unwrap(),
+                inputs: InputGlobs::Default,
+            },
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "0cb73634538618658f092cd7a3a373c243513a6a"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+            ]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_large_file_recorded_as_slowest() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        // Add a large (8 MiB) *untracked* file to the foo package. Tracked
+        // files are read from the git tree, but untracked files are hashed by
+        // reading their contents (`hash_objects`) — exactly the path that
+        // dominates startup time for a large temp file, and the one the
+        // slowest-files recorder instruments. Do NOT commit it.
+        let big_path = repo_root.join_components(&["packages", "foo", "big.bin"]);
+        big_path
+            .create_with_contents(vec![0u8; 8 * 1024 * 1024])
+            .unwrap();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        // Drive a hash of the foo package so the big file gets hashed.
+        let foo_path = repo_root.join_components(&["packages", "foo"]);
+        let spec = HashSpec {
+            package_path: repo_root.anchor(&foo_path).unwrap(),
+            inputs: InputGlobs::Default,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if hash_watcher.get_file_hashes(spec.clone()).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let slowest = hash_watcher.slowest_files();
+        assert!(
+            slowest.iter().any(|f| f.path.as_str().ends_with("big.bin")),
+            "expected big.bin in slowest files, got: {:?}",
+            slowest.iter().map(|f| f.path.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_switch_branch() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        let bar_path = repo_root.join_components(&["packages", "bar"]);
+        let bar_spec = HashSpec {
+            package_path: repo_root.anchor(&bar_path).unwrap(),
+            inputs: InputGlobs::Default,
+        };
+
+        // We need to give filewatching time to do the initial scan,
+        // but this should resolve in short order to the expected value.
+        retry_get_hash(
+            &hash_watcher,
+            bar_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("bar-file", "b9bdb1e4875f7397b3f68c104bc249de0ecd3f8e"),
+                ("package.json", "b39117e03f0dbe217b957f58a2ad78b993055088"),
+            ]),
+        )
+        .await;
+
+        create_fixture_branch(&repo_root);
+
+        retry_get_hash(
+            &hash_watcher,
+            bar_spec,
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("baz-file", "a5395ccf1b8966f3ea805aff0851eac13acb3540"),
+                ("package.json", "b39117e03f0dbe217b957f58a2ad78b993055088"),
+            ]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_non_existent_package() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        // Ensure everything is up and running so we can verify the correct error for a
+        // non-existing package
+        let foo_path = repo_root.join_components(&["packages", "foo"]);
+        // We need to give filewatching time to do the initial scan,
+        // but this should resolve in short order to the expected value.
+        retry_get_hash(
+            &hash_watcher,
+            HashSpec {
+                package_path: repo_root.anchor(&foo_path).unwrap(),
+                inputs: InputGlobs::Default,
+            },
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+            ]),
+        )
+        .await;
+
+        let non_existent_path = repo_root.join_components(&["packages", "non-existent"]);
+        let relative_non_existent_path = repo_root.anchor(&non_existent_path).unwrap();
+        let result = hash_watcher
+            .get_file_hashes(HashSpec {
+                package_path: relative_non_existent_path.clone(),
+                inputs: InputGlobs::Default,
+            })
+            .await;
+        assert_matches!(result, Err(crate::hash_watcher::Error::UnknownPackage(unknown_spec)) if unknown_spec.package_path == relative_non_existent_path);
+    }
+
+    // we don't have a signal for when hashing is complete after having made a file
+    // change set a long timeout, but retry several times to try to hit the
+    // success case quickly
+    async fn retry_get_hash(
+        hash_watcher: &HashWatcher,
+        spec: HashSpec,
+        timeout: Duration,
+        expected: GitHashes,
+    ) {
+        let deadline = Instant::now() + timeout;
+        let mut error = None;
+        let mut last_value = None;
+        while Instant::now() < deadline {
+            match hash_watcher.get_file_hashes(spec.clone()).await {
+                Ok(hashes) => {
+                    if *hashes == expected {
+                        return;
+                    } else {
+                        last_value = Some(hashes);
+                    }
+                }
+                Err(e) => {
+                    error = Some(e);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("failed to get expected hashes. Error {error:?}, last hashes: {last_value:?}");
+    }
+
+    fn make_expected(expected: Vec<(&str, &str)>) -> GitHashes {
+        let mut map = GitHashes::new();
+        for (path, hash) in expected {
+            map.insert(
+                RelativeUnixPathBuf::new(path).unwrap(),
+                OidHash::from_hex_str(hash),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn test_file_hashes_ancestor() {
+        let mut hashes = FileHashes::new();
+
+        let root = AnchoredSystemPathBuf::try_from("").unwrap();
+        let foo_path = root.join_components(&["apps", "foo"]);
+        let foo_spec = HashSpec {
+            package_path: foo_path.clone(),
+            inputs: InputGlobs::Default,
+        };
+        hashes.insert(foo_spec, HashState::Hashes(Arc::new(GitHashes::new())));
+        let foo_bar_path = root.join_components(&["apps", "foobar"]);
+        let foo_bar_spec = HashSpec {
+            package_path: foo_bar_path.clone(),
+            inputs: InputGlobs::Default,
+        };
+        hashes.insert(foo_bar_spec, HashState::Hashes(Arc::new(GitHashes::new())));
+
+        let foo_candidate = foo_path.join_component("README.txt");
+        let result = hashes.get_changed_specs(&foo_candidate);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.into_iter().next().unwrap().package_path, foo_path);
+
+        let foo_bar_candidate = foo_bar_path.join_component("README.txt");
+        let result = hashes.get_changed_specs(&foo_bar_candidate);
+        assert_eq!(
+            result.into_iter().next().unwrap().package_path,
+            foo_bar_path
+        );
+
+        // try a path that is a *sibling* of a package, but not itself a package
+        let sibling = root.join_components(&["apps", "sibling"]);
+        let result = hashes.get_changed_specs(&sibling);
+        assert!(result.is_empty());
+
+        // try a path that is a *sibling* of a package, but not itself a package, but
+        // starts with the prefix of a package
+        let decoy = root.join_components(&["apps", "foodecoy"]);
+        let result = hashes.get_changed_specs(&decoy);
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_package_discovery_does_not_starve_queries_or_shutdown() {
+        let tmp = tempdir().unwrap();
+        let repo_root = AbsoluteSystemPathBuf::try_from(tmp.path())
+            .unwrap()
+            .to_realpath()
+            .unwrap();
+        let (package_discovery_tx, package_discovery_rx) = tokio::sync::watch::channel(None);
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        let (file_event_tx, file_events) = WatchSource::channel();
+        let subscriber = Subscriber::new(repo_root, package_discovery_rx, SCM::Manual, query_rx);
+        let handle = tokio::spawn(subscriber.watch(exit_rx, file_events));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while file_event_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriber should start");
+
+        drop(package_discovery_tx);
+        let unknown_spec = HashSpec {
+            package_path: AnchoredSystemPathBuf::from_raw("packages/unknown").unwrap(),
+            inputs: InputGlobs::Default,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        query_tx
+            .send(Query::GetHash(unknown_spec, response_tx))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("closed package discovery must not starve queries")
+            .unwrap();
+        assert_matches!(response, Err(super::Error::UnknownPackage(_)));
+
+        drop(file_event_tx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("subscriber should stop when file watching closes")
+            .unwrap();
+        drop(exit_tx);
+    }
+
+    #[tokio::test]
+    async fn file_event_during_hashing_defers_follow_up_hash() {
+        let tmp = tempdir().unwrap();
+        let repo_root = AbsoluteSystemPathBuf::try_from(tmp.path())
+            .unwrap()
+            .to_realpath()
+            .unwrap();
+        let (package_discovery_tx, package_discovery_rx) = tokio::sync::watch::channel(None);
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let (hash_update_tx, mut hash_update_rx) = tokio::sync::mpsc::channel(1);
+        let subscriber = Subscriber::new(
+            repo_root.clone(),
+            package_discovery_rx,
+            SCM::Manual,
+            query_rx,
+        );
+
+        let package_dir = repo_root.join_components(&["packages", "foo"]);
+        let package_path = repo_root.anchor(&package_dir).unwrap();
+        let spec = HashSpec {
+            package_path: package_path.clone(),
+            inputs: InputGlobs::Default,
+        };
+        let debouncer = Arc::new(Debouncer::new(Duration::from_millis(0)));
+        debouncer.debounce().await;
+
+        let mut hashes = FileHashes::new();
+        hashes.insert(
+            spec.clone(),
+            HashState::Pending {
+                version: Version(0),
+                debouncer,
+                txs: vec![],
+                rerun_after_current: false,
+            },
+        );
+
+        let changed_file = package_dir.join_component("large.bin");
+        subscriber.handle_file_event(
+            notify::Event {
+                kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                paths: vec![changed_file.into()],
+                attrs: Default::default(),
+            },
+            &mut hashes,
+            &hash_update_tx,
+        );
+
+        match hashes.get_mut(&spec).expect("spec should still be tracked") {
+            HashState::Pending {
+                rerun_after_current,
+                ..
+            } => assert!(*rerun_after_current),
+            _ => panic!("expected pending hash"),
+        }
+        assert!(hash_update_rx.try_recv().is_err());
+
+        drop(query_tx);
+        drop(package_discovery_tx);
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_basic_file_changes_with_inputs() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        let foo_path = repo_root.join_components(&["packages", "foo"]);
+        let foo_inputs = GlobSet::from_raw(vec!["*-file".to_string()], vec![]).unwrap();
+        let foo_spec = HashSpec {
+            package_path: repo_root.anchor(&foo_path).unwrap(),
+            inputs: InputGlobs::Specific(foo_inputs),
+        };
+        // package.json is always included, whether it matches your inputs or not.
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                // Note that without inputs, we'd also get the .gitignore file
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+            ]),
+        )
+        .await;
+
+        // update foo-file
+        let foo_file_path = repo_root.join_components(&["packages", "foo", "foo-file"]);
+        foo_file_path
+            .create_with_contents("new foo-file contents")
+            .unwrap();
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "5f6796bbd23dcdc9d30d07a2d8a4817c34b7f1e7"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+            ]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_switch_branch_with_inputs() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        let bar_path = repo_root.join_components(&["packages", "bar"]);
+
+        let bar_inputs = GlobSet::from_raw(vec!["*z-file".to_string()], vec![]).unwrap();
+        let bar_spec = HashSpec {
+            package_path: repo_root.anchor(&bar_path).unwrap(),
+            inputs: InputGlobs::Specific(bar_inputs),
+        };
+
+        // package.json is always included, whether it matches your inputs or not.
+        retry_get_hash(
+            &hash_watcher,
+            bar_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![(
+                "package.json",
+                "b39117e03f0dbe217b957f58a2ad78b993055088",
+            )]),
+        )
+        .await;
+
+        create_fixture_branch(&repo_root);
+
+        retry_get_hash(
+            &hash_watcher,
+            bar_spec,
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("baz-file", "a5395ccf1b8966f3ea805aff0851eac13acb3540"),
+                ("package.json", "b39117e03f0dbe217b957f58a2ad78b993055088"),
+            ]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_inputs_with_turbo_defaults() {
+        let (_tmp, repo_root) = setup_fixture();
+        // Add an ignored file
+        let foo_path = repo_root.join_components(&["packages", "foo"]);
+        let ignored_file_path = foo_path.join_components(&["out", "ignored-file"]);
+        ignored_file_path.ensure_dir().unwrap();
+        ignored_file_path
+            .create_with_contents("included in inputs")
+            .unwrap();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        let extra_foo_inputs = GlobSet::from_raw(vec!["out/*-file".to_string()], vec![]).unwrap();
+        let foo_spec = HashSpec {
+            package_path: repo_root.anchor(&foo_path).unwrap(),
+            inputs: InputGlobs::DefaultWithExtras(extra_foo_inputs),
+        };
+
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+                (
+                    "out/ignored-file",
+                    "e77845e6da275119a0a5a38dbb824773a45f66b3",
+                ),
+            ]),
+        )
+        .await;
+
+        // update ignored file
+        ignored_file_path
+            .create_with_contents("included in inputs again")
+            .unwrap();
+
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+                (
+                    "out/ignored-file",
+                    "9fdccf172d999222f3b2103d99a8658de7b21fc6",
+                ),
+            ]),
+        )
+        .await;
+
+        // update foo-file
+        let foo_file_path = repo_root.join_components(&["packages", "foo", "foo-file"]);
+        foo_file_path
+            .create_with_contents("new foo-file contents")
+            .unwrap();
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec,
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "5f6796bbd23dcdc9d30d07a2d8a4817c34b7f1e7"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (".gitignore", "89f9ac04aac6c8ee66e158853e7d0439b3ec782d"),
+                (
+                    "out/ignored-file",
+                    "9fdccf172d999222f3b2103d99a8658de7b21fc6",
+                ),
+            ]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_negative_inputs() {
+        let (_tmp, repo_root) = setup_fixture();
+
+        let watcher = FileSystemWatcher::new_with_default_cookie_dir(&repo_root).unwrap();
+
+        let recv = watcher.watch();
+        let cookie_writer = CookieWriter::new(
+            watcher.cookie_dir(),
+            Duration::from_millis(100),
+            recv.clone(),
+        );
+
+        let scm = SCM::new(&repo_root);
+        assert!(!scm.is_manual());
+        let package_watcher =
+            PackageWatcher::new(repo_root.clone(), recv, cookie_writer, false).unwrap();
+        let package_discovery = package_watcher.watch_discovery();
+        let hash_watcher =
+            HashWatcher::new(repo_root.clone(), package_discovery, watcher.watch(), scm);
+
+        let foo_path = repo_root.join_components(&["packages", "foo"]);
+        let dist_path = foo_path.join_component("dist");
+        dist_path
+            .join_component("some-dist-file")
+            .create_with_contents("dist file")
+            .unwrap();
+        dist_path
+            .join_component("extra-file")
+            .create_with_contents("extra file")
+            .unwrap();
+        let foo_inputs = GlobSet::from_raw_unfiltered(vec![
+            "!dist/extra-file".to_string(),
+            "**/*-file".to_string(),
+        ])
+        .unwrap();
+        let foo_spec = HashSpec {
+            package_path: repo_root.anchor(&foo_path).unwrap(),
+            inputs: InputGlobs::Specific(foo_inputs),
+        };
+
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (
+                    "dist/some-dist-file",
+                    "21aa527e5ea52d11bf53f493df0dbe6d659b6a30",
+                ),
+            ]),
+        )
+        .await;
+
+        dist_path
+            .join_component("some-dist-file")
+            .create_with_contents("new dist file contents")
+            .unwrap();
+        retry_get_hash(
+            &hash_watcher,
+            foo_spec.clone(),
+            Duration::from_secs(2),
+            make_expected(vec![
+                ("foo-file", "9317666a2e7b729b740c706ab79724952c97bde4"),
+                ("package.json", "395351bdd7167f351af3396d3225ebe97a7a4d13"),
+                (
+                    "dist/some-dist-file",
+                    "03d4fc427f0bccc1ca7053fc889fa73e54a402fa",
+                ),
+            ]),
+        )
+        .await;
+    }
+}

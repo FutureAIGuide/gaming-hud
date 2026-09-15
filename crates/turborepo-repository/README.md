@@ -1,0 +1,28 @@
+# turborepo-repository
+
+## Purpose
+
+Repository detection, package discovery, and package graph construction. Understands monorepo structure, workspace configurations, and inter-package dependencies.
+
+## Architecture
+
+```
+Repository root
+    └── turborepo-repository
+        ├── inference/ - Detect repo type and package manager
+        ├── package_manager/ - npm, pnpm, yarn, bun support
+        ├── package_graph/ - Dependency graph of workspace packages
+        ├── external_resolution.rs - Explicit external dependency resolution domains
+        ├── package_json/ - package.json parsing
+        └── discovery/ - Find all workspace packages
+```
+
+Key types:
+- `PackageGraph` - Graph of workspace packages and their dependencies
+- `RepositoryKnowledge` - Immutable authority for package and aggregate identities, paths, kinds, and toolchain provenance
+- `PackageManager` - Abstraction over npm/pnpm/yarn/bun
+- `ExternalResolutionDomain` - Immutable domain identity, membership, and resolution data
+
+## Notes
+
+Separated from `turborepo-lib` so the `@turbo/repository` NPM package can use it without pulling in the entire CLI. This crate is foundational - most other crates depend on it for package information.
