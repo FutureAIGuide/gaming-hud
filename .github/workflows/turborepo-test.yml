@@ -111,7 +111,7 @@ jobs:
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: vercel/setup-turborepo-remote-cache-action@49d7b1b46ba4c9251e1977986bfe18336feabc8f # v1.1.0
         with:
-          team: ${{ vars.TURBO_TEAM }}
+          team: ${{ vars.TURBO_TEAM || github.repository_owner }}
 
       - name: Setup Node
         uses: ./.github/actions/setup-node
@@ -212,7 +212,7 @@ jobs:
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: vercel/setup-turborepo-remote-cache-action@49d7b1b46ba4c9251e1977986bfe18336feabc8f # v1.1.0
         with:
-          team: ${{ vars.TURBO_TEAM }}
+          team: ${{ vars.TURBO_TEAM || github.repository_owner }}
 
       - name: Setup Node
         uses: ./.github/actions/setup-node
@@ -317,7 +317,7 @@ jobs:
       - name: Set up Turborepo Remote Cache
         uses: vercel/setup-turborepo-remote-cache-action@49d7b1b46ba4c9251e1977986bfe18336feabc8f # v1.1.0
         with:
-          team: ${{ vars.TURBO_TEAM }}
+          team: ${{ vars.TURBO_TEAM || github.repository_owner }}
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -368,7 +368,7 @@ jobs:
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: vercel/setup-turborepo-remote-cache-action@49d7b1b46ba4c9251e1977986bfe18336feabc8f # v1.1.0
         with:
-          team: ${{ vars.TURBO_TEAM }}
+          team: ${{ vars.TURBO_TEAM || github.repository_owner }}
 
       - name: Setup Node
         uses: ./.github/actions/setup-node
@@ -448,7 +448,7 @@ jobs:
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: vercel/setup-turborepo-remote-cache-action@49d7b1b46ba4c9251e1977986bfe18336feabc8f # v1.1.0
         with:
-          team: ${{ vars.TURBO_TEAM }}
+          team: ${{ vars.TURBO_TEAM || github.repository_owner }}
 
       - name: Setup Node
         uses: ./.github/actions/setup-node
