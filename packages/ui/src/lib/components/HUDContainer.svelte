@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { hudState } from '../state/hud.svelte.js';
+  import { hudState } from '../../state/hud.svelte.js';
 
   type Guide = {
     id: string;
@@ -87,7 +87,8 @@
                 type="button"
                 class="w-full rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
                 onclick={() => handleSelect(guide)}
-                aria-label={activeGuide?.id === guide.id ? `Select guide ${guide.title} (currently active)` : `Select guide ${guide.title}`}
+                aria-label={activeGuide?.id === guide.id ? `Select ${guide.gameName} guide ${guide.title} (currently active)` : `Select ${guide.gameName} guide ${guide.title}`}
+                aria-current={activeGuide?.id === guide.id ? 'true' : undefined}
               >
                 <p class="text-xs uppercase tracking-wide text-cyan-200/90">{guide.gameName}</p>
                 <h3 class="mt-1 text-sm font-semibold">{guide.title}</h3>
@@ -121,6 +122,10 @@
     list-style: none;
     margin: 0;
     padding-left: 0;
+  }
+
+  .hud-shell {
+    contain: layout paint;
   }
 
   @media (min-width: 1280px) {
