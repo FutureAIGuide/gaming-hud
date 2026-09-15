@@ -38,6 +38,13 @@
   let activeGuide = $state<Guide | null>(null);
 
   function handleSelectGuide(guide: Guide) {
+    if (activeGuide?.id === guide.id) {
+      activeGuide = null;
+      hudState.setActiveGame(null);
+      hudState.setActiveGuide(null);
+      return;
+    }
+
     activeGuide = guide;
     hudState.setActiveGame(guide.gameId);
     hudState.setActiveGuide(guide.id);
