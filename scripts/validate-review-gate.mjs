@@ -109,7 +109,8 @@ export async function run() {
     pull.state !== "open" ||
     pull.draft
   ) {
-    throw new Error("Pull request metadata is not eligible for review");
+    console.log("Pull request metadata is not eligible for review; skipping");
+    return;
   }
 
   const expectedHeadSha = process.env.EXPECTED_HEAD_SHA;

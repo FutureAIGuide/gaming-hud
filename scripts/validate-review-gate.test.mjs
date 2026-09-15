@@ -106,6 +106,16 @@ test("finds non-release paths after the first page", async () => {
   );
 });
 
+test("skips draft pull requests", async () => {
+  await withGitHub(
+    { files: [{ filename: "version.txt" }] },
+    async (pull) => {
+      pull.draft = true;
+      await assert.doesNotReject(run());
+    },
+  );
+});
+
 test("requires human approval for non-release changes to exempt paths", async () => {
   await withGitHub(
     { files: [{ filename: "packages/turbo/package.json" }] },

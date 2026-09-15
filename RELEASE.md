@@ -529,7 +529,7 @@ packages/turbo-releaser/dist/index.js tag --repo-root . --version-path version.t
 | `TURBO_BINARY_PATH`         | Override binary path (development only)                      | `/path/to/turbo`              |
 | `GH_TOKEN`                  | GitHub API token for commit and workflow-owned PR operations | `${{ secrets.GITHUB_TOKEN }}` |
 
-The main branch ruleset exempts exact generated release paths from the native team-review requirement and requires the `Release Semantic Validation` check. Non-release changes to those paths still require a write-authorized human approval through the review gate. Validation reads files through the GitHub API using immutable base and head SHAs.
+The main branch ruleset exempts exact generated release paths from the native team-review requirement and requires the `Release Semantic Validation` check. Non-release changes to those paths still require a write-authorized human approval through the review gate. Draft pull requests and pull requests that are not targeting the default branch skip this gate until they become review-eligible. Validation reads files through the GitHub API using immutable base and head SHAs.
 
 #### API Commit Helper
 
