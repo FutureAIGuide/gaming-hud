@@ -110,7 +110,7 @@ pub async fn cmd_run_click_through_latency_test(
         .iter()
         .filter(|sample| sample.elapsed_ms >= target_ms)
         .count() as u32;
-    let passed = over_target_count == 0;
+    let passed = max_ms < target_ms;
 
     println!(
         "[latency-test:{label}] target_ms={target_ms:.1} total_toggles={completed_toggles} \
