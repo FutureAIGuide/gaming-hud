@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { hudState } from '../state/hud.svelte.ts';
+
   type Guide = {
     id: string;
     title: string;
@@ -14,6 +16,10 @@
     guides?: Guide[];
   };
 
+  type LayoutItem = Guide & {
+    gameName: string;
+  };
+
   const {
     games = [],
     activeGuide = null,
@@ -26,9 +32,9 @@
 
   let isVisible = $state(true);
 
-  const layoutItems = $derived(
+  const layoutItems = $derived<LayoutItem[]>(
     games.flatMap((game) =>
-      (game.guides ?? []).map((guide: Guide) => ({
+      (game.guides ?? []).map((guide) => ({
         ...guide,
         gameName: game.name
       }))
@@ -47,7 +53,8 @@
 </script>
 
 <section
-  class="hud-shell fixed inset-4 z-[2147483000] pointer-events-none"
+  class="hud-shell fixed inset-4 pointer-events-none"
+  style={`z-index: ${hudState.zLayer};`}
   aria-label="Gaming HUD overlay container"
 >
   <div class="pointer-events-auto h-full w-full">
@@ -57,32 +64,30 @@
       </h2>
 
       <button
+        type="button"
         class="rounded-lg border border-white/25 bg-black/30 px-3 py-1.5 text-xs font-medium text-white hover:bg-black/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300"
         onclick={handleToggleVisibility}
         aria-label={isVisible ? "Hide HUD guides" : "Show HUD guides"}
-        aria-pressed={!isVisible}
+        aria-pressed={isVisible}
       >
         {isVisible ? "Hide" : "Show"}
       </button>
     </header>
 
     {#if isVisible}
-      <div
+      <ul
         class="hud-grid rounded-2xl border border-white/20 bg-white/10 p-3 text-white backdrop-blur-[10px]"
-        role="list"
         aria-label="Available game guides"
       >
         {#if hasItems}
           {#each layoutItems as guide (guide.id)}
-            <article
-              role="listitem"
-              class="will-change-auto rounded-xl border border-white/15 bg-black/25 p-3 transition-transform duration-150 hover:scale-[1.01] focus-within:scale-[1.01]"
-              aria-label={`Guide card: ${guide.title} for ${guide.gameName}`}
-            >
+            <li class="rounded-xl border border-white/15 bg-black/25 p-3 transition-transform duration-150 hover:scale-[1.01] focus-within:scale-[1.01]">
               <button
-                class="w-full rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300"
+                type="button"
+                class="w-full rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
                 onclick={() => handleSelect(guide)}
                 aria-label={`Select guide ${guide.title}`}
+                aria-pressed={activeGuide?.id === guide.id}
               >
                 <p class="text-xs uppercase tracking-wide text-cyan-200/90">{guide.gameName}</p>
                 <h3 class="mt-1 text-sm font-semibold">{guide.title}</h3>
@@ -96,27 +101,26 @@
                   Active
                 </p>
               {/if}
-            </article>
+            </li>
           {/each}
         {:else}
-          <p class="col-span-full rounded-xl border border-dashed border-white/25 bg-black/20 p-4 text-sm text-white/80">
-            No guides yet. Add guides to a game to populate this HUD.
-          </p>
+          <li class="col-span-full list-none rounded-xl border border-dashed border-white/25 bg-black/20 p-4 text-sm text-white/80">
+            <p>No guides yet. Add guides to a game to populate this HUD.</p>
+          </li>
         {/if}
-      </div>
+      </ul>
     {/if}
   </div>
 </section>
 
 <style>
-  .hud-shell {
-    z-index: 2147483000;
-  }
-
   .hud-grid {
     display: grid;
     gap: 0.75rem;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    list-style: none;
+    margin: 0;
+    padding-left: 0;
   }
 
   @media (min-width: 1280px) {

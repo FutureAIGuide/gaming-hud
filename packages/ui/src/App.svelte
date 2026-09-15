@@ -1,6 +1,6 @@
 <script lang="ts">
   import HUDContainer from './lib/components/HUDContainer.svelte';
-  import { hudState } from './lib/state/hud.svelte';
+  import { hudState } from './lib/state/hud.svelte.ts';
 
   type Guide = {
     id: string;
@@ -50,9 +50,23 @@
 </script>
 
 <main class="min-h-screen bg-zinc-900 p-4 text-white">
-  <HUDContainer
-    {games}
-    {activeGuide}
-    onSelectGuide={handleSelectGuide}
-  />
+  <div class="mb-4">
+    <button
+      type="button"
+      class="rounded-md border border-white/25 bg-black/30 px-3 py-2 text-xs font-medium text-white hover:bg-black/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300"
+      onclick={() => hudState.toggleOverlay()}
+      aria-label={hudState.overlayVisible ? 'Hide HUD overlay' : 'Show HUD overlay'}
+      aria-pressed={hudState.overlayVisible}
+    >
+      {hudState.overlayVisible ? 'Hide HUD Overlay' : 'Show HUD Overlay'}
+    </button>
+  </div>
+
+  {#if hudState.overlayVisible}
+    <HUDContainer
+      {games}
+      {activeGuide}
+      onSelectGuide={handleSelectGuide}
+    />
+  {/if}
 </main>
