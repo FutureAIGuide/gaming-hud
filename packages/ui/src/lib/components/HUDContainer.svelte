@@ -67,8 +67,8 @@
         type="button"
         class="rounded-lg border border-white/25 bg-black/30 px-3 py-1.5 text-xs font-medium text-white hover:bg-black/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300"
         onclick={handleToggleVisibility}
-        aria-label={isVisible ? "Hide HUD guides" : "Show HUD guides"}
-        aria-pressed={isVisible}
+        aria-label="Toggle HUD guides visibility"
+        aria-pressed={!isVisible}
       >
         {isVisible ? "Hide" : "Show"}
       </button>
@@ -81,13 +81,15 @@
       >
         {#if hasItems}
           {#each layoutItems as guide (guide.id)}
-            <li class="rounded-xl border border-white/15 bg-black/25 p-3 transition-transform duration-150 hover:scale-[1.01] focus-within:scale-[1.01]">
+            <li
+              class="rounded-xl border border-white/15 bg-black/25 p-3 transition-transform duration-150 hover:scale-[1.01] focus-within:scale-[1.01]"
+              aria-current={activeGuide?.id === guide.id ? 'true' : undefined}
+            >
               <button
                 type="button"
                 class="w-full rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
                 onclick={() => handleSelect(guide)}
                 aria-label={`Select guide ${guide.title}`}
-                aria-pressed={activeGuide?.id === guide.id}
               >
                 <p class="text-xs uppercase tracking-wide text-cyan-200/90">{guide.gameName}</p>
                 <h3 class="mt-1 text-sm font-semibold">{guide.title}</h3>
