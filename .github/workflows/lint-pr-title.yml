@@ -8,6 +8,7 @@ on:
     types:
       - opened
       - edited
+      - ready_for_review
       - synchronize
       - reopened
 
@@ -17,6 +18,7 @@ permissions:
 jobs:
   main:
     name: Validate PR title
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
