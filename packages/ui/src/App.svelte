@@ -40,7 +40,6 @@
   function handleSelectGuide(guide: Guide) {
     if (activeGuide?.id === guide.id) {
       activeGuide = null;
-      hudState.setActiveGame(null);
       hudState.setActiveGuide(null);
       return;
     }

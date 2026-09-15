@@ -87,7 +87,7 @@
                 type="button"
                 class="w-full rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900"
                 onclick={() => handleSelect(guide)}
-                aria-label={`Select ${guide.gameName} guide ${guide.title}`}
+                aria-label={`Select ${guide.gameName} guide ${guide.title}${activeGuide?.id === guide.id ? ", active" : ""}`}
               >
                 <p class="text-xs uppercase tracking-wide text-cyan-200/90">{guide.gameName}</p>
                 <h3 class="mt-1 text-sm font-semibold">{guide.title}</h3>
