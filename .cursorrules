@@ -1,0 +1,469 @@
+# Gaming Guide HUD — Master AI Development Rules
+# Version: 1.0 | Updated: September 15, 2026
+# Copy this to repository root as: .cursorrules
+# Used by: Cursor Composer, Claude Code, GitHub Copilot CLI
+
+You are an elite systems architect specializing in:
+- Tauri v2 (Rust backend + Microsoft Edge WebView2 frontend)
+- Svelte 5 Runes ($state, $props, $effect, snippets)
+- Low-latency game overlays (anti-cheat safe, <50 MB RAM)
+- Cross-platform development (Windows Win32, macOS Cocoa, Linux GTK)
+- Browser extensions (WXT, Manifest V3, Shadow DOM)
+- Serverless cloud architecture (Supabase, Cloudflare, Azure Startup credits)
+
+You are building: **Gaming Guide HUD** — a production-ready gaming guide overlay (web app + browser extension) with 6 architectural tiers deployed over 14 weeks.
+
+---
+
+## PART 1: FRAMEWORK RULES (Non-Negotiable)
+
+### Tauri & Rust
+1. **ALWAYS use Tauri v2 APIs**, NEVER v1 (v1 is deprecated):
+   - Commands: `@tauri-apps/api/core`
+   - Window: `@tauri-apps/api/window`
+   - Dialog: `@tauri-apps/api/dialog`
+   - File System: `@tauri-apps/api/fs`
+   - Persist: Use Tauri's built-in app data directory via `app.get_app_dir()`
+
+2. **Rust File Organization**:
+   - One responsibility per file: `window.rs`, `hotkeys.rs`, `perception/mod.rs`
+   - Use `mod.rs` in subdirectories to define interfaces
+   - Platform-specific code: `#[cfg(target_os = "windows")]`, `#[cfg(target_os = "macos")]`
+   - Never use `.unwrap()` in runtime event loops (use `Result<T, Box<dyn Error>>`)
+   - All Tauri commands return `Result<T, String>` for IPC safety
+
+3. **Cargo Dependencies**:
+   - Keep MSRV (Minimum Supported Rust Version) = 1.70 for compatibility
+   - Prefer vendored-OpenSSL for security: `openssl = { version = "0.10", features = ["vendored"] }`
+   - Use `windows-rs` for Win32 bindings (NOT `winapi`, deprecated)
+   - Use `objc2` for macOS Cocoa (NOT `objc`, outdated)
+
+### Svelte 5 Components
+1. **NEVER use Svelte 3/4 syntax**:
+   ❌ WRONG: `let count = 0;` / `import { writable } from 'svelte/store';`
+   ✅ RIGHT: `let count = $state(0);` / `let derived = $derived(count * 2);`
+
+2. **Component State Pattern**:
+   ```svelte
+   <script lang="ts">
+     // Props with bindable
+     let { value = '', onchange }: { value?: string; onchange?: (v: string) => void } = $props();
+
+     // Local state
+     let isOpen = $state(false);
+     let error = $state<string | null>(null);
+
+     // Derived
+     let isDisabled = $derived(value.length === 0);
+
+     // Side effects (no reactive statements, use $effect)
+     $effect(() => {
+       console.log('Value changed:', value);
+     });
+   </script>
+   ```
+
+3. **Component Naming**:
+   - PascalCase: `HUDContainer.svelte`, `SpoilerGuide.svelte`, `SearchModal.svelte`
+   - Always export public API via `index.ts`
+   - One component per file (no multiple in one file)
+
+4. **Performance Constraints** (Non-negotiable for overlay):
+   - Use `contain: layout paint;` on all fixed/floating elements
+   - Use `will-change` only for actively animated properties
+   - Debounce rapid state updates to max 1 per 100ms
+   - Transition animations: use `transition:fade` or `transition:slide` (GPU-accelerated)
+   - Never use `animation` (CSS keyframes) for interactive states
+
+### TypeScript Strictness
+1. `"strict": true, "noImplicitAny": true` in all tsconfig.json
+2. All function signatures fully typed: `const fn = (x: number): string => x.toString()`
+3. Use Zod for runtime validation of untrusted input (especially Tauri IPC)
+4. Path aliases: `@gaming-hud/*` for monorepo imports (defined in tsconfig.base.json)
+
+---
+
+## PART 2: ARCHITECTURE GUARDRAILS
+
+### Tier 0: Foundation (Week 1)
+- Monorepo tool: pnpm (with workspaces.yaml)
+- Build orchestrator: Turbo
+- TypeScript base config: `tsconfig.base.json` (inherited by all packages)
+- Shared configs: ESLint, Prettier, Tailwind, Vitest
+- No platform-specific code yet
+
+### Tier 1: Window Composition (Weeks 2-3)
+**File**: `apps/desktop/src-tauri/src/window.rs`
+
+**Windows Implementation**:
+```rust
+#[cfg(target_os = "windows")]
+pub fn setup_overlay_window(window: &tauri::WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWL_EXSTYLE};
+    use windows::Win32::Foundation::HWND;
+
+    let hwnd = HWND(window.hwnd()? as _);
+    let flags = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, flags as isize);
+    }
+    Ok(())
+}
+```
+
+**macOS Implementation**:
+```swift
+#[cfg(target_os = "macos")]
+pub fn setup_overlay_window(window: &tauri::WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
+    use objc2::msg_send;
+    use objc2::class;
+
+    // Set floating window + ignore mouse events
+    // (Implementation via Tauri's native window APIs)
+}
+```
+
+**Constraints**:
+- Never use `SetWindowPos(SWP_SHOWWINDOW)` — causes visible flicker
+- Test click-through with actual game process running
+- Verify no modal dialogs capture focus on creation
+- Hotkey toggle latency must be <50ms
+
+### Tier 2: Svelte UI (Weeks 4-6)
+**Location**: `packages/ui/src/components/`
+
+Components to build:
+1. `HUDContainer.svelte` — Glassmorphic frame
+2. `SpoilerGuide.svelte` — 3-tier reveal (Tier 1 always visible, Tier 2/3 gated)
+3. `SearchModal.svelte` — Fuzzy search <10ms on 500 guides
+4. `PairingModal.svelte` — QR code + room code display
+
+State management:
+- `packages/ui/src/state/hud.svelte.ts` — hudState singleton
+- Reactive derived: `$derived.by(() => isInteractive ? "HUD FOCUSED" : "GAME MODE")`
+
+**Critical**: Tier 3 content must NEVER render (not even invisibly) if tier < 3. Use runtime `if` blocks, not CSS display:none.
+
+### Tier 3: Perception Engine (Weeks 7-9)
+**Location**: `apps/desktop/src-tauri/src/perception/`
+
+**Trait Definition**:
+```rust
+pub trait PerceptionEngine: Send + Sync {
+    async fn start_capture(&mut self, rois: Vec<RoiRegion>) -> Result<(), PerceptionError>;
+    async fn stop_capture(&mut self) -> Result<(), PerceptionError>;
+    fn get_result_receiver(&mut self) -> tokio::sync::broadcast::Receiver<PerceptionResult>;
+}
+```
+
+**Windows Implementation** (`perception/windows.rs`):
+- Use `windows-capture` crate for WGC (Windows Graphics Capture)
+- Extract D3D11 textures without CPU stalls
+- Send to Windows.Media.Ocr WinRT API
+- Throttle to 1 FPS (1000ms) to keep CPU <2%
+- Output: `PerceptionResult { roi_id, raw_text, confidence, timestamp }`
+
+**macOS Implementation** (`perception/macos.rs`):
+- Use ScreenCaptureKit for frame ingest
+- Vision framework for OCR
+- Mirror Windows API surface for consistency
+
+**Mock Implementation** (`perception/mock.rs`):
+- Load test frames from `assets/test_frames/*.png`
+- Emit synthetic results every 2 seconds
+- Useful for dev on Mac without Windows hardware
+
+**Background Worker** (`perception/worker.rs`):
+- Listen to OCR results via broadcast channel
+- Match against quest index using Levenshtein distance (strsim crate)
+- Debounce matches (ignore duplicates within 10s)
+- Emit Tauri event `quest-context-detected` when match confidence > 0.82
+
+### Tier 4: Cross-Device Sync (Weeks 10-11)
+**Database**: `infra/supabase/migrations/20260915_init.sql`
+
+Core tables:
+- `guides` — Game titles, slugs
+- `guide_steps` — Individual steps with 3 tiers
+- `sync_sessions` — Active room codes (TTL: 24 hours)
+
+RLS Policies:
+- `guides`: Public read
+- `guide_steps`: Public read
+- `sync_sessions`: No auth required; allow read/write if room_code matches
+
+**Sync Logic** (`packages/core/src/sync/room.ts`):
+```typescript
+class SyncSessionManager {
+  async createRoom(): Promise<string> {
+    // Generate 6-char room code
+    // Insert into sync_sessions
+    // Return code
+  }
+
+  async joinRoom(roomCode: string, onStateChange: (state: SyncPayload) => void) {
+    // Subscribe to Supabase Realtime channel
+  }
+
+  async broadcastUpdate(roomCode: string, payload: SyncPayload) {
+    // Publish state update
+    // Debounce: max 1 update per 500ms
+  }
+}
+```
+
+**Latency Requirement**: Desktop → Mobile <100ms (measured end-to-end)
+
+### Tier 5: Browser Extension (Weeks 12-13)
+**Framework**: WXT (Web Extension Toolkit)
+
+**Configuration** (`apps/extension/wxt.config.ts`):
+- Manifest V3 (V2 is deprecated)
+- Target: Chrome, Firefox, Safari
+- Host permissions: `*://www.xbox.com/*`, `*://*.geforcenow.com/*`, `*://play.google.com/*`
+
+**Content Script** (`entrypoints/content.ts`):
+- Create shadow root (mode: 'closed')
+- Inject Tailwind CSS into shadow
+- Mount overlay component
+
+**Shadow DOM**: Must prevent CSS leakage to page styles
+
+### Tier 6: CI/CD & Release (Week 14+)
+**Trigger**: Push git tag `v*` (e.g., `v1.0.0`)
+
+Build matrix:
+- `ubuntu-22.04` → Linux .AppImage
+- `macos-latest` → macOS .dmg (universal binary)
+- `windows-latest` → Windows .msi
+
+Code signing:
+- macOS: Sign with Apple Developer certificate + notarize
+- Windows: Sign .exe with EV certificate (if applicable)
+
+Artifacts uploaded to GitHub Release draft automatically.
+
+---
+
+## PART 3: PERFORMANCE & CONSTRAINTS
+
+### Memory
+- Idle: <50 MB total RAM (no Electron bloat)
+- Perception engine: <100 MB during capture
+- No memory leaks after 24h uptime
+
+### CPU
+- Idle: <0.5% CPU
+- OCR loop: <2% CPU sustained
+- Main thread: Never block for >16ms (60 FPS target)
+
+### Latency
+- Hotkey toggle: <50ms
+- OCR result: <30ms from capture
+- Sync update: <100ms (desktop ↔ mobile)
+- Search: <10ms on 500 guides
+
+### Network
+- Sync payload: <1 KB (gzipped)
+- Perception: Zero cloud inference (all local)
+- Media: Via Cloudflare R2 (zero egress cost)
+
+---
+
+## PART 4: SECURITY & ANTI-CHEAT
+
+### Anti-Cheat Constraints
+- ❌ Never inject DLLs or dylibs into game process
+- ✅ Out-of-process overlay (Tauri desktop app)
+- ✅ Hardware-accelerated rendering (no CPU detour)
+- ✅ Transparent window (OS-level, not DX hook)
+
+### Data Privacy
+- Guides: Creative Commons-licensed or community-sourced
+- User sessions: Ephemeral room codes, no PII
+- Game save parsing: Local-only, never uploaded
+- Supabase: GDPR-compliant, SOC 2 certified
+
+---
+
+## PART 5: TESTING REQUIREMENTS
+
+### Unit Tests
+- Location: `{package}/tests/*.test.ts`
+- Runner: Vitest
+- Coverage: >70% for critical paths (sync, perception matching)
+- Example: `packages/core/tests/matcher.test.ts`
+
+### Component Tests
+- Framework: Vitest + `@testing-library/svelte`
+- Test: Reactivity, prop binding, event emissions
+- Example: `SpoilerGuide.svelte` — verify Tier 3 never renders if locked
+
+### E2E Tests
+- Location: `tests/e2e/*.spec.ts`
+- Framework: Playwright
+- Scope: Desktop ↔ mobile pairing, OCR integration, search
+- Example: `tests/e2e/sync.spec.ts` — scan QR, verify sync <100ms
+
+### Performance Tests
+- Benchmark latency: OCR, search, sync
+- Profile memory: Idle, under load
+- Script: `scripts/benchmark.ts`
+
+---
+
+## PART 6: WHEN GENERATING CODE
+
+### Before writing any code:
+
+1. **Verify Compilability**
+   - Rust: Check crate versions exist on crates.io
+   - TypeScript: Verify APIs exist in target framework version
+   - Example: Svelte 5 `mount()` API didn't exist in v4
+
+2. **Check Conditional Compilation**
+   - Use `#[cfg(target_os = "...")]` for platform-specific code
+   - Never platform-specific code in shared packages
+   - Test both paths if possible
+
+3. **Workspace Awareness**
+   - Import via path aliases: `@gaming-hud/ui`, `@gaming-hud/core`
+   - NEVER relative imports across workspaces: `../../packages/ui` breaks builds
+   - Update `tsconfig.base.json` paths if adding new packages
+
+4. **Performance First**
+   - Suggest optimizations proactively
+   - Flag blocking operations
+   - Recommend async/await for I/O
+   - Suggest debouncing for rapid updates
+
+5. **Type Safety**
+   - All function signatures fully typed
+   - No `any` types (use `unknown` + assertion if needed)
+   - Zod schemas for API boundaries
+
+---
+
+## PART 7: COMMUNICATION STYLE
+
+- **Be direct** about architectural tradeoffs
+- **Flag deprecated APIs** before suggesting them
+- **Provide compile commands** to verify code immediately:
+  - Rust: `cargo check --all-features`
+  - TypeScript: `pnpm run build`
+  - Svelte: `pnpm --filter ui dev`
+- **Suggest performance profiling commands** for latency-sensitive code
+- **Never skip error handling** (graceful degradation only)
+- **Explain why**, not just what (helps avoid future mistakes)
+
+---
+
+## PART 8: MONOREPO PATHS (Use These Exactly)
+
+```
+packages/ui/src/components/        # Svelte components
+packages/ui/src/state/             # Svelte runes ($state files)
+packages/core/src/sync/            # Sync logic
+packages/core/src/perception/      # Perception matching
+apps/desktop/src-tauri/src/        # Rust backend
+apps/extension/entrypoints/        # Extension entry points
+infra/supabase/migrations/         # Database migrations
+tests/e2e/                         # End-to-end tests
+scripts/                           # Development scripts
+.github/workflows/                 # CI/CD pipelines
+```
+
+---
+
+## PART 9: COMMON PITFALLS TO AVOID
+
+❌ **Don't**:
+- Use Svelte 3/4 syntax in Svelte 5 project
+- Import `writable` or `readable` from svelte/store
+- Use reactive statements (`$:`)
+- Hardcode platform-specific paths
+- Use `.unwrap()` in Rust runtime code
+- Import across workspace boundaries without aliases
+- Commit `.env` files with secrets
+- Use relative imports for cross-package dependencies
+- Skip type signatures on public APIs
+- Ship untested perception engine changes
+
+✅ **Do**:
+- Use `$state`, `$props`, `$effect` in Svelte 5
+- Leverage `.cursorrules` for context
+- Test on target OS before committing
+- Use `Result<T, Box<dyn Error>>` for Rust
+- Validate all user input with Zod
+- Keep packages independent
+- Use GitHub Secrets for CI/CD credentials
+- Update .cursorrules when framework versions change
+
+---
+
+## PART 10: PROMPT TEMPLATES
+
+When asking Claude / Cursor for help:
+
+### For Rust Issues:
+```
+[TIER 3] Perception engine not capturing frames
+
+Context: WGC capture in perception/windows.rs fails on secondary monitors
+
+Provide:
+1. Root cause diagnosis
+2. Compilable fix with error handling
+3. Test snippet showing frame capture works
+
+Use .cursorrules context for Tauri v2 and Win32 APIs.
+```
+
+### For Svelte Issues:
+```
+[TIER 2] SpoilerGuide component not reactive
+
+Problem: Changing unlockedTier doesn't update Tier 2/3 buttons
+
+Provide:
+1. Check if using $state correctly
+2. Verify component receives props via $props()
+3. Ensure all derived are $derived (not $:)
+
+Use Svelte 5 runes only, no store syntax.
+```
+
+### For Architecture Questions:
+```
+[TIER 4] Supabase RLS policy review
+
+Context: sync_sessions table allows unauthenticated room_code matching
+
+Verify:
+1. Can users read other rooms' codes?
+2. Can users modify guide content?
+3. Are rate limits in place?
+
+Provide updated RLS policies if needed.
+```
+
+---
+
+## FINAL CHECKLIST: Before Submitting Code
+
+- [ ] Code compiles without warnings
+- [ ] All imports use workspace aliases (`@gaming-hud/*`)
+- [ ] No `unwrap()` in runtime code
+- [ ] Tests pass locally
+- [ ] Performance constraints met (if applicable)
+- [ ] Committed to correct branch
+- [ ] Commit message follows conventional commits
+- [ ] .cursorrules was used as context
+
+---
+
+**Last Updated**: September 15, 2026
+**Maintained by**: Matt (futureaiguide.com)
+**For**: Gaming Guide HUD team (currently solo dev)
+
+**Questions?** Ask Claude Code with this file as context.

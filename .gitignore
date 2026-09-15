@@ -1,0 +1,15 @@
+node_modules/
+.turbo/
+dist/
+coverage/
+target/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+
+# Scaffold leftovers / local agent temp
+_tmp_*
+Claude outputs/

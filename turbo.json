@@ -1,0 +1,25 @@
+{
+  "extends": ["//"],
+  "pipeline": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**"],
+      "hashAlgorithm": "md5"
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": ["dist/**"]
+    },
+    "type-check": {
+      "outputs": [".tsc-out/**"]
+    },
+    "test": {
+      "outputs": ["coverage/**"]
+    }
+  },
+  "globalEnv": ["NODE_ENV"],
+  "globalPassThroughEnv": ["GITHUB_*"]
+}
